@@ -1278,6 +1278,12 @@ class State:
             series = self.hist.get(pid, {})
             return {k: [[round(t, 2), v] for t, v in dq if t > since] for k, dq in series.items()}
 
+    def clear_log(self, pid=None):
+        with self.lock:
+            keep = [e for e in self.events if pid and e["psu"] != pid]
+            self.events.clear()
+            self.events.extend(keep)
+
     def events_since(self, since, pid=None):
         with self.lock:
             return [e for e in self.events if e["id"] > since and (pid is None or e["psu"] == pid)]
@@ -1496,8 +1502,25 @@ class Monitor:
     def control(self, pid, action):
         bm, p = self.find(pid)
         bm.run(p, lambda bus: do_control(bus, p, action))
-        self.state.log(pid, "warn", "Action manuelle : %s" % action)
+        self.state.log(pid, "info" if action == "clear_faults" else "warn",
+                       "Défauts effacés (CLEAR_FAULTS)" if action == "clear_faults" else "Action manuelle : %s" % action)
         p.reset()
+
+    def clear_many(self, target):
+        """CLEAR_FAULTS sur tous les PSU visibles ('all') ou ceux d'un bus ('bus:N')."""
+        ok, failed = 0, []
+        for bm in list(self.buses.values()):
+            if target != "all" and target != "bus:%d" % bm.num:
+                continue
+            for p in list(bm.psus):
+                if p.id not in self.state.seen:
+                    continue
+                try:
+                    self.control(p.id, "clear_faults")
+                    ok += 1
+                except OSError as e:
+                    failed.append("%s : %s" % (p.name, e.strerror or e))
+        return {"status": "ok", "cleared": ok, "failed": failed}
 
     def halt(self):
         self.stop.set()
@@ -1646,6 +1669,16 @@ def make_handler(mon, auth, control):
                     return self._json({"error": "bus %d introuvable" % bnum}, 404)
                 mon.bus(bnum).scan_async()
                 return self._json({"scanning": True})
+            if path == "/api/clear_log":
+                state.clear_log(str(body.get("id", "")) or None)
+                return self._json({"status": "ok"})
+            if path == "/api/action" and body.get("action") == "clear_faults":
+                # CLEAR_FAULTS n'efface que les bits mémorisés et ne redémarre pas un PSU coupé
+                # (PMBus Part II §15.1) : autorisé sans --control
+                pid = str(body.get("id", ""))
+                if pid == "all" or pid.startswith("bus:"):
+                    return self._hw(lambda: mon.clear_many(pid))
+                return self._hw(lambda: (mon.control(pid, "clear_faults"), {"status": "ok"})[1])
             if path not in ("/api/action", "/api/write"):
                 return self.send_error(404)
             if not control:
@@ -1738,10 +1771,11 @@ input[type=number]{width:120px}
 .mtile:hover{border-color:var(--acc);background:var(--hov)}.mtile .ico{font-size:30px;width:52px;height:52px;border-radius:12px;background:var(--hov);display:flex;align-items:center;justify-content:center;flex:none}
 .mtile .name{font-size:17px;font-weight:600}.mtile .arrow{margin-left:auto;font-size:26px;color:var(--mut)}
 .addr{font-family:ui-monospace,monospace;font-size:22px;font-weight:700}
+#toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--fg);color:var(--bg);padding:10px 16px;border-radius:8px;font-size:14px;max-width:90vw;display:none;z-index:9;box-shadow:0 4px 16px rgba(0,0,0,.25)}
 .res{font-size:13px}.res.ok{color:var(--ok)}.res.bad{color:var(--fault)}
 </style></head><body>
 <header><a class="brand" href="#/">PMBus Monitor</a><nav id="crumbs"></nav><span class="grow"></span><span id="sim"></span><span id="meta"></span></header>
-<main id="view"></main>
+<main id="view"></main><div id="toast"></div>
 <script>
 const SEV={ok:"OK",warn:"Avertissement",fault:"Défaut",off:"Éteint",offline:"Hors ligne",pending:"…",info:"Info"};
 const KIND={psu:"Alimentation",mux:"Mux I2C",eeprom:"EEPROM",systeme:"Système BBB",autre:"Autre",doublon:"Doublon"};
@@ -1758,11 +1792,27 @@ async function api(url){const r=await fetch(url,{cache:"no-store"});if(r.status=
 async function post(url,body){
   const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json","X-Requested-With":"pmbus-monitor"},body:JSON.stringify(body||{})});
   const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||("HTTP "+r.status));return j}
+let toastT=null;
+function toast(msg){const t=$("toast");t.textContent=msg;t.style.display="block";clearTimeout(toastT);toastT=setTimeout(()=>t.style.display="none",5000)}
+async function clearFaults(target,label){
+  if(!confirm(`Effacer les erreurs mémorisées ${label} ?\n(CLEAR_FAULTS : un défaut toujours présent réapparaît aussitôt ; un PSU coupé n'est pas redémarré.)`))return;
+  try{const r=await post("api/action",{id:target,action:"clear_faults"});
+    if(r.cleared!=null)toast(`✓ Erreurs effacées sur ${r.cleared} PSU`+(r.failed.length?` — échec : ${r.failed.join(", ")}`:""));
+    else toast("✓ Erreurs effacées. Si une alarme revient tout de suite, le défaut est toujours présent.");
+    if(typeof refreshNow==="function")refreshNow();
+  }catch(e){toast("✗ "+e.message)}
+}
+async function clearLog(id){
+  if(!confirm(id?"Vider le journal de ce PSU ?":"Vider tout le journal des événements ?"))return;
+  try{await post("api/clear_log",{id:id||""});if(cur){cur.events=[]}toast("✓ Journal vidé");refreshNow();return true}catch(e){toast("✗ "+e.message)}
+}
 function crumbs(list){$("crumbs").innerHTML=list.map(([t,h])=>h?`<a href="${h}">${esc(t)}</a>`:`<span>${esc(t)}</span>`).join(" › ")}
 function common(j){lastCommon=j;$("sim").innerHTML=j.mock?'<span class="sim">SIMULATION</span>':"";$("meta").textContent="maj "+hm(j.time)}
 /* boucle de rafraîchissement liée à la page affichée */
+let refreshNow=()=>{};
 function loop(fn,ms){
   const my=++tok;clearTimeout(timer);
+  refreshNow=()=>{clearTimeout(timer);if(my===tok)tick()};
   const tick=async()=>{if(my!==tok)return;try{await fn()}catch(e){if(e.message!=="auth")$("meta").textContent="erreur : "+e.message}
     if(my===tok)timer=setTimeout(tick,typeof ms==="function"?ms():ms)};
   tick();
@@ -1805,6 +1855,7 @@ function menu(){
 function pmbusBuses(){
   crumbs([C_HOME,["PSU / PMBus"]]);
   $("view").innerHTML=`<div class="bar"><a class="btn gray" href="#/">← Accueil</a><h1>PSU / PMBus — choisis un bus</h1><span class="grow"></span>
+    <button class="btn red" onclick="clearFaults('all','de tous les PSU')">🧹 Effacer les erreurs de tous les PSU</button>
     <button class="btn gray" id="rs">↻ Relancer la détection</button></div><div id="list" class="grid"></div>`;
   $("rs").onclick=e=>rescanAll(e.target);
   loop(async()=>{
@@ -1823,7 +1874,8 @@ function pmbusBuses(){
 function pmbusBus(n){
   crumbs([C_HOME,C_PSU,["Bus "+n]]);
   $("view").innerHTML=`<div class="bar"><a class="btn gray" href="#/pmbus">← Bus I2C</a><h1>Bus I2C ${n} — choisis une adresse</h1><span class="grow"></span>
-    <span id="scaninfo" class="mut"></span><button class="btn gray" id="rs">↻ Rescanner</button></div><div id="list" class="grid"></div>`;
+    <span id="scaninfo" class="mut"></span><button class="btn red" onclick="clearFaults('bus:${n}','de tous les PSU du bus ${n}')">🧹 Effacer les erreurs du bus</button>
+    <button class="btn gray" id="rs">↻ Rescanner</button></div><div id="list" class="grid"></div>`;
   $("rs").onclick=async()=>{try{await post("api/scan",{bus:n})}catch(e){alert(e.message)}};
   loop(async()=>{
     const b=await api("api/bus?num="+n);common(b);
@@ -1880,8 +1932,11 @@ function i2cBus(n){
 /* ================= Journal ================= */
 function journal(){
   crumbs([C_HOME,["Journal"]]);
-  $("view").innerHTML=`<div class="bar"><a class="btn gray" href="#/">← Accueil</a><h1>Journal des événements</h1></div><div class="panel"><table id="ev"></table></div>`;
+  $("view").innerHTML=`<div class="bar"><a class="btn gray" href="#/">← Accueil</a><h1>Journal des événements</h1><span class="grow"></span>
+    <button class="btn red" onclick="clearFaults('all','de tous les PSU')">🧹 Effacer les erreurs de tous les PSU</button>
+    <button class="btn gray" id="clr">Vider le journal</button></div><div class="panel"><table id="ev"></table></div>`;
   let evs=[],last=0;
+  $("clr").onclick=async()=>{if(await clearLog("")){evs=[];refreshNow()}};
   loop(async()=>{
     const e=await api("api/events?since="+last);for(const x of e){evs.push(x);last=Math.max(last,x.id)}
     const j=await api("api/buses");common(j);
@@ -1975,7 +2030,8 @@ function bitsHtml(reg,val){
 }
 function showErrors(j){
   const d=j.data;let h="";
-  if(j.control)h+=`<div class="bar"><button class="btn gray" onclick="act('clear_faults')">Effacer les défauts (CLEAR_FAULTS)</button></div>`;
+  h+=`<div class="bar"><button class="btn red" onclick="clearFaults(cur.id,'de ce PSU')">🧹 Effacer les erreurs</button>
+    <span class="mut">envoie CLEAR_FAULTS au PSU</span><span class="grow"></span><button class="btn gray" onclick="clearLog(cur.id)">Vider le journal de ce PSU</button></div>`;
   if(!d||!d.online)h+=offlineMsg(d);
   else{
     h+=`<div class="panel"><h3 style="margin-top:0">Alarmes actives</h3>`;
@@ -2084,7 +2140,7 @@ async function showSettings(){
     <button class="btn gray" ${ctl?"":"disabled"} onclick="act('soft_off')">Arrêt progressif</button>
     <button class="btn amber" ${ctl?"":"disabled"} onclick="act('margin_low')">Marge basse</button>
     <button class="btn amber" ${ctl?"":"disabled"} onclick="act('margin_high')">Marge haute</button>
-    <button class="btn gray" ${ctl?"":"disabled"} onclick="act('clear_faults')">Effacer les défauts</button>
+    <button class="btn gray" onclick="clearFaults(cur.id,'de ce PSU')">Effacer les erreurs</button>
     <span class="grow"></span><button class="btn gray" onclick="showSettings()">↻ Relire</button></div></div>`;
   const g={};s.settings.forEach(x=>(g[x.group]=g[x.group]||[]).push(x));
   for(const [name,rows] of Object.entries(g)){

@@ -40,6 +40,11 @@ Le terminal n'affiche que l'adresse de la page (`--verbose` pour plus de détail
 - **Système** : adresses de la page, pilote I2C, options, état de chaque bus, relance de la détection.
 
 Tous les bus sont balayés au démarrage (le bus 0 interne à la BBB en lecture seule).
+
+**Effacer les erreurs** (CLEAR_FAULTS) : bouton dans l'onglet *Erreurs* d'un PSU, sur la page d'un bus
+(tous ses PSU), sur la liste des bus et dans le *Journal* (tous les PSU). Il n'exige pas `--control` :
+d'après la spec (Part II §15.1), CLEAR_FAULTS ne fait qu'effacer les bits mémorisés et ne redémarre pas
+un PSU coupé ; un défaut toujours présent réapparaît aussitôt. Le *Journal* peut aussi être vidé.
 Les boutons « ← Retour », le fil d'Ariane et le bouton « précédent » du navigateur fonctionnent partout.
 Les bus autres que 0 sont balayés au démarrage ; le bus 0 (interne à la BBB) seulement quand on l'ouvre.
 Deux emplacements renvoyant le même numéro de série sont signalés comme doublon.
