@@ -13,11 +13,11 @@ Topologies gérées (combinables via --config) :
 
 Exemples :
   ./pmbus_monitor.py --scan                                   # cherche les périphériques
-  ./pmbus_monitor.py --autodetect --web                       # détecte les PSU 0x58-0x5F
-  ./pmbus_monitor.py --addr 0x58 0x59 --web                   # 2 PSU en direct
+  ./pmbus_monitor.py --autodetect                             # détecte les PSU 0x58-0x5F
+  ./pmbus_monitor.py --addr 0x58 0x59                         # 2 PSU en direct (web par défaut)
   ./pmbus_monitor.py --mux 0x70 --channels 0-3 --addr 0x58 --web   # 4 PSU derrière un PDB
   ./pmbus_monitor.py --config psus.json --web --auth admin:secret # topologie complète
-  ./pmbus_monitor.py --addr 0x58 --once --json                # une mesure JSON, sans web
+  ./pmbus_monitor.py --addr 0x58 --once --json                # une mesure JSON ; --terminal pour le mode texte
 
 Interface web : https://<ip-bbb>:8443 (certificat auto-signé, l'avertissement du
 navigateur est normal ; --http pour du HTTP clair sur le port 8080).
@@ -1161,7 +1161,7 @@ def render_table(results):
     lines = ["".join(n.ljust(w) if w else n for n, w in cols), "-" * 90]
     for r in results:
         if not r.get("online"):
-            lines.append("%-12s HORS LIGNE : %s" % (r["name"][:11], r.get("error", "")))
+            lines.append("%-12s HORS LIGNE : %s  -> essaie --scan ou --autodetect" % (r["name"][:11], r.get("error", "")))
             continue
         cells = [r["name"][:11].ljust(12)] + [fv(r, k).ljust(w) for (n, w), k in zip(cols[1:-1], keys[1:-1])]
         state = "OK" if r["summary"] == "ok" else (
@@ -1234,7 +1234,8 @@ def main():
     p.add_argument("--json", action="store_true", help="sortie JSON (terminal)")
     p.add_argument("--csv", metavar="FICHIER", help="ajouter les mesures à un fichier CSV")
     w = p.add_argument_group("interface web")
-    w.add_argument("--web", action="store_true", help="servir l'interface web (HTTPS par défaut)")
+    p.add_argument("--terminal", action="store_true", help="affichage terminal au lieu de l'interface web")
+    w.add_argument("--web", action="store_true", help="(défaut) servir l'interface web, HTTPS par défaut")
     w.add_argument("--port", type=int, help="port (défaut 8443 en HTTPS, 8080 en HTTP)")
     w.add_argument("--host", default="0.0.0.0", help="adresse d'écoute (défaut toutes)")
     w.add_argument("--http", action="store_true", help="HTTP clair, sans TLS")
@@ -1248,6 +1249,8 @@ def main():
     w.add_argument("--history", type=int, default=3600, help="durée d'historique gardée en mémoire, en s (défaut 3600)")
     args = p.parse_args()
     args.channels = parse_channels(args.channels)
+    # L'interface web est le mode par défaut ; --once / --json / --terminal donnent le mode terminal.
+    args.web = not (args.terminal or args.once or args.json)
 
     if args.scan:
         try:

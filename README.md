@@ -20,9 +20,9 @@ PMBUS/
 
 ```
 ./pmbus_monitor.py --scan                                        # cherche les périphériques
-./pmbus_monitor.py --autodetect --web                            # détecte les PSU 0x58-0x5F
-./pmbus_monitor.py --addr 0x58 0x59 --web                        # PSU en direct
-./pmbus_monitor.py --mux 0x70 --channels 0-3 --addr 0x58 --web   # via un PDB
+./pmbus_monitor.py --autodetect                            # détecte les PSU 0x58-0x5F
+./pmbus_monitor.py --addr 0x58 0x59                        # PSU en direct
+./pmbus_monitor.py --mux 0x70 --channels 0-3 --addr 0x58   # via un PDB
 ./pmbus_monitor.py --config psus.example.json --web --auth admin:secret   # multi-bus / multi-mux
 ```
 
