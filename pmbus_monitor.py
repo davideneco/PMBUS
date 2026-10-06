@@ -2,8 +2,9 @@
 """
 pmbus_monitor.py - Moniteur PMBus mono-fichier pour BeagleBone Black.
 
-Sans dépendance externe (Python 3 standard + ioctl /dev/i2c-N ; `openssl` pour
-générer le certificat HTTPS auto-signé, présent par défaut sur Debian/BBB).
+Python 3 standard. `pip install smbus2` est recommandé (pilote utilisé en priorité) ; sans lui,
+le script parle directement à /dev/i2c-N. `openssl` génère le certificat HTTPS auto-signé.
+Chaque transaction I2C est temporisée (3 ms) et retentée : nécessaire avec beaucoup de PSU.
 
 Topologies gérées (combinables via --config) :
   - PSU directement sur un bus I2C de la BBB
@@ -18,6 +19,8 @@ Exemples :
   ./pmbus_monitor.py --mux 0x70 --channels 0-3 --addr 0x58 --web   # 4 PSU derrière un PDB
   ./pmbus_monitor.py --config psus.json --web --auth admin:secret # topologie complète
   ./pmbus_monitor.py --addr 0x58 --once --json                # une mesure JSON ; --terminal pour le mode texte
+  ./pmbus_monitor.py --mock                                   # 3 PSU simulés, pour tester la page sans matériel
+  ./pmbus_monitor.py --auth admin:secret --control            # + boutons effacer défauts / ON / OFF
 
 Interface web : https://<ip-bbb>:8443 (certificat auto-signé, l'avertissement du
 navigateur est normal ; --http pour du HTTP clair sur le port 8080).
@@ -41,7 +44,9 @@ import csv
 import ctypes
 import fcntl
 import hmac
+import io
 import json
+import math
 import os
 import signal
 import socket
@@ -79,13 +84,33 @@ class _SmbusIoctl(ctypes.Structure):
                 ("data", ctypes.POINTER(_SmbusData))]
 
 
+try:
+    from smbus2 import SMBus as _SMBus
+except ImportError:
+    _SMBus = None
+
+I2C_SMBUS_I2C_BLOCK_DATA = 8
+
+
 class I2CBus:
+    """Bus I2C : smbus2 s'il est installé, sinon ioctl direct.
+    Chaque transaction est temporisée (pacing) et retentée : beaucoup de PSU ratent la 1re."""
+    pace = 0.003          # pause après chaque transaction réussie (s)
+
     def __init__(self, bus):
-        self.fd = os.open("/dev/i2c-%d" % bus, os.O_RDWR)
-        self.addr = None
+        self.num = bus
+        self.retries = 2   # nouvelles tentatives par transaction (0 pendant les balayages)
+        self.sm = _SMBus(bus) if _SMBus else None
+        self.backend = "smbus2" if self.sm else "ioctl"
+        if not self.sm:
+            self.fd = os.open("/dev/i2c-%d" % bus, os.O_RDWR)
+            self.addr = None
 
     def close(self):
-        os.close(self.fd)
+        if self.sm:
+            self.sm.close()
+        else:
+            os.close(self.fd)
 
     def _xfer(self, addr, rw, cmd, size, data=None):
         if addr != self.addr:
@@ -95,26 +120,166 @@ class I2CBus:
         fcntl.ioctl(self.fd, I2C_SMBUS, _SmbusIoctl(rw, cmd, size, ctypes.pointer(d)))
         return d
 
+    def _try(self, fn, *a):
+        n = self.retries + 1
+        for i in range(n):
+            try:
+                r = fn(*a)
+                if self.pace:
+                    time.sleep(self.pace)
+                return r
+            except OSError:
+                if i == n - 1:
+                    raise
+                time.sleep(0.005)
+
     def write_byte(self, addr, value):
-        self._xfer(addr, I2C_SMBUS_WRITE, value, I2C_SMBUS_BYTE)
+        if self.sm:
+            return self._try(self.sm.write_byte, addr, value)
+        self._try(self._xfer, addr, I2C_SMBUS_WRITE, value, I2C_SMBUS_BYTE)
 
     def read_byte(self, addr):
-        return self._xfer(addr, I2C_SMBUS_READ, 0, I2C_SMBUS_BYTE).byte
+        if self.sm:
+            return self._try(self.sm.read_byte, addr)
+        return self._try(self._xfer, addr, I2C_SMBUS_READ, 0, I2C_SMBUS_BYTE).byte
 
     def read_byte_data(self, addr, cmd):
-        return self._xfer(addr, I2C_SMBUS_READ, cmd, I2C_SMBUS_BYTE_DATA).byte
+        if self.sm:
+            return self._try(self.sm.read_byte_data, addr, cmd)
+        return self._try(self._xfer, addr, I2C_SMBUS_READ, cmd, I2C_SMBUS_BYTE_DATA).byte
 
     def write_byte_data(self, addr, cmd, value):
+        if self.sm:
+            return self._try(self.sm.write_byte_data, addr, cmd, value)
         d = _SmbusData()
         d.byte = value
-        self._xfer(addr, I2C_SMBUS_WRITE, cmd, I2C_SMBUS_BYTE_DATA, d)
+        self._try(self._xfer, addr, I2C_SMBUS_WRITE, cmd, I2C_SMBUS_BYTE_DATA, d)
 
     def read_word_data(self, addr, cmd):
-        return self._xfer(addr, I2C_SMBUS_READ, cmd, I2C_SMBUS_WORD_DATA).word
+        if self.sm:
+            return self._try(self.sm.read_word_data, addr, cmd)
+        return self._try(self._xfer, addr, I2C_SMBUS_READ, cmd, I2C_SMBUS_WORD_DATA).word
+
+    def write_word_data(self, addr, cmd, value):
+        if self.sm:
+            return self._try(self.sm.write_word_data, addr, cmd, value)
+        d = _SmbusData()
+        d.word = value
+        self._try(self._xfer, addr, I2C_SMBUS_WRITE, cmd, I2C_SMBUS_WORD_DATA, d)
 
     def read_block_data(self, addr, cmd):
-        d = self._xfer(addr, I2C_SMBUS_READ, cmd, I2C_SMBUS_BLOCK_DATA)
+        """Chaîne PMBus (octet de longueur + caractères). On essaie d'abord le « I2C block read »
+        car le contrôleur I2C de la BBB ne sait pas faire le SMBus block read."""
+        try:
+            if self.sm:
+                raw = bytes(self._try(self.sm.read_i2c_block_data, addr, cmd, 17))
+            else:
+                d = _SmbusData()
+                d.block[0] = 17
+                d = self._try(self._xfer, addr, I2C_SMBUS_READ, cmd, I2C_SMBUS_I2C_BLOCK_DATA, d)
+                raw = bytes(d.block[1:18])
+            if 0 < raw[0] <= 16:
+                return raw[1:1 + raw[0]]
+        except OSError:
+            pass
+        if self.sm:
+            return bytes(self.sm.read_block_data(addr, cmd))
+        d = self._try(self._xfer, addr, I2C_SMBUS_READ, cmd, I2C_SMBUS_BLOCK_DATA)
         return bytes(d.block[1:1 + min(d.block[0], 32)])
+
+
+# --------------------------------------------------------------------------
+# Simulation (--mock) : 3 PSU fictifs, pour essayer l'interface sans matériel
+# --------------------------------------------------------------------------
+def encode_linear11(v):
+    exp = -16
+    while abs(v / (2.0 ** exp)) > 1000 and exp < 15:
+        exp += 1
+    return ((exp & 0x1F) << 11) | (int(round(v / (2.0 ** exp))) & 0x7FF)
+
+
+class MockBus:
+    """Même interface que I2CBus. 0x58 = OK, 0x59 = en défaut, 0x5A = éteint."""
+    backend = "simulation"
+    PSUS = {0x58: "ok", 0x59: "fault", 0x5A: "off"}
+
+    def __init__(self, bus):
+        self.num, self.retries = bus, 0
+        self.op = {a: (0x00 if k == "off" else 0x80) for a, k in self.PSUS.items()}
+
+    def close(self):
+        pass
+
+    def _kind(self, a):
+        if a not in self.PSUS:
+            raise OSError(121, "Remote I/O error")
+        return self.PSUS[a]
+
+    def read_byte(self, a):
+        self._kind(a)
+        return 0
+
+    def write_byte(self, a, v):
+        if a in self.PSUS and v == 0x03:   # CLEAR_FAULTS
+            return
+        raise OSError(121, "Remote I/O error")
+
+    def write_byte_data(self, a, c, v):
+        self._kind(a)
+        if c == CMD_OPERATION:
+            self.op[a] = v
+
+    def write_word_data(self, a, c, v):
+        self._kind(a)
+
+    def read_byte_data(self, a, c):
+        k = self._kind(a)
+        off = self.op[a] == 0
+        if c == 0x78:
+            return (0x40 if off else 0x00) | (0x04 if k == "fault" else 0)
+        if c == CMD_VOUT_MODE:
+            return 0x17
+        if c == CMD_OPERATION:
+            return self.op[a]
+        if c == CMD_PMBUS_REVISION:
+            return 0x33
+        if c == CMD_CAPABILITY:
+            return 0xB0
+        if c == 0x7C and k == "fault":
+            return 0x30        # VIN_UV_WARNING + VIN_UV_FAULT
+        if c == 0x7D and k == "fault":
+            return 0x40        # OT_WARNING
+        if c in (0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0x7F, 0x80, 0x81):
+            return 0
+        raise OSError(121, "nack")
+
+    def read_word_data(self, a, c):
+        k = self._kind(a)
+        off = self.op[a] == 0
+        t = time.time() + a
+        w = math.sin(t / 6.0)
+        if c == CMD_STATUS_WORD:
+            return (0x0040 if off else 0) | (0x2004 if k == "fault" else 0)
+        pout = 0.0 if off else 600 + 150 * w
+        iout = pout / 12.0
+        table = {0x88: 230.0 + w, 0x89: 0 if off else (pout / 0.93) / 230.0, 0x97: 0 if off else pout / 0.93,
+                 0x96: pout, 0x8C: iout, 0x8D: 28 if off else 41 + 3 * w, 0x8E: 27 if off else 36 + 2 * w,
+                 0x90: 1200 if off else 4200 + 300 * w, 0x91: 1200 if off else 4100 + 250 * w,
+                 0x55: 264.0, 0x59: 170.0, 0x57: 260.0, 0x58: 180.0, 0x4F: 100.0, 0x51: 85.0, 0xA7: 1000.0}
+        if c == 0x8B:
+            return 0 if off else int(round(12.0 * 2 ** 9))        # LINEAR16, exposant -9
+        if c in (0x21, 0x40, 0x42, 0x43, 0x44, 0xA4, 0xA5):
+            return int(round({0x40: 14.0, 0x42: 13.2, 0x43: 10.8, 0x44: 10.0}.get(c, 12.0) * 2 ** 9))
+        if c in table:
+            return encode_linear11(table[c])
+        raise OSError(121, "nack")
+
+    def read_block_data(self, a, c):
+        self._kind(a)
+        txt = {0x99: b"ACME", 0x9A: b"SIM-1000W", 0x9B: b"R1.0", 0x9E: b"SIM%04X" % a}.get(c)
+        if txt is None:
+            raise OSError(121, "nack")
+        return txt
 
 
 def safe(fn, *a):
@@ -286,6 +451,187 @@ INFO_TEXT = [("Fabricant (MFR_ID)", 0x99), ("Modèle (MFR_MODEL)", 0x9A),
              ("Date de fabrication", 0x9D), ("N° de série", 0x9E)]
 
 
+REGISTERS = [   # (code, nom, type, catégorie, description) - table inspirée de pmbus_multi_psu_gui.py
+    (0x00, 'PAGE', 'byte_page', 'Configuration', 'Active channel/phase selection (0 to 31, 0xFF=All)'),
+    (0x01, 'OPERATION', 'byte_op', 'Configuration', 'Active power stage state (0x80=On, 0x00=Off, Margins)'),
+    (0x02, 'ON_OFF_CONFIG', 'byte_onoff', 'Configuration', 'Hardware CONTROL pin and software enable logic'),
+    (0x10, 'WRITE_PROTECT', 'byte_wp', 'Configuration', 'Register write protection status'),
+    (0x19, 'CAPABILITY', 'byte_cap', 'Configuration', 'Supported features (PEC, Max speed, SMBALERT#)'),
+    (0x35, 'VIN_ON', 'word_volt', 'Startup & Input (VIN)', 'Input voltage turn-on / startup threshold (V)'),
+    (0x36, 'VIN_OFF', 'word_volt', 'Startup & Input (VIN)', 'Input voltage turn-off / undervoltage shutdown threshold (V)'),
+    (0x55, 'VIN_OV_FAULT_LIMIT', 'word_volt', 'Startup & Input (VIN)', 'Input Overvoltage Fault shutdown threshold (V)'),
+    (0x56, 'VIN_OV_FAULT_RESPONSE', 'byte_resp', 'Startup & Input (VIN)', 'Response profile for Input Overvoltage Fault'),
+    (0x57, 'VIN_OV_WARN_LIMIT', 'word_volt', 'Startup & Input (VIN)', 'Input Overvoltage Warning advisory threshold (V)'),
+    (0x58, 'VIN_UV_WARN_LIMIT', 'word_volt', 'Startup & Input (VIN)', 'Input Undervoltage Warning advisory threshold (V)'),
+    (0x59, 'VIN_UV_FAULT_LIMIT', 'word_volt', 'Startup & Input (VIN)', 'Input Undervoltage Fault shutdown threshold (V)'),
+    (0x5A, 'VIN_UV_FAULT_RESPONSE', 'byte_resp', 'Startup & Input (VIN)', 'Response profile for Input Undervoltage Fault'),
+    (0x5B, 'IIN_OC_FAULT_LIMIT', 'word_curr', 'Startup & Input (VIN)', 'Input Overcurrent Fault shutdown threshold (A)'),
+    (0x5C, 'IIN_OC_FAULT_RESPONSE', 'byte_resp', 'Startup & Input (VIN)', 'Response profile for Input Overcurrent Fault'),
+    (0x5D, 'IIN_OC_WARN_LIMIT', 'word_curr', 'Startup & Input (VIN)', 'Input Overcurrent Warning advisory threshold (A)'),
+    (0x6B, 'PIN_OP_WARN_LIMIT', 'word_power', 'Startup & Input (VIN)', 'Input Overpower Warning advisory threshold (W)'),
+    (0x88, 'READ_VIN', 'word_volt', 'Startup & Input (VIN)', 'Real-time measured input voltage (V)'),
+    (0x89, 'READ_IIN', 'word_curr', 'Startup & Input (VIN)', 'Real-time measured input current (A)'),
+    (0x97, 'READ_PIN', 'word_power', 'Startup & Input (VIN)', 'Real-time measured input power (W)'),
+    (0x20, 'VOUT_MODE', 'byte_vmode', 'Output Voltage (VOUT)', 'VOUT data format (Linear/VID/Direct) and exponent'),
+    (0x21, 'VOUT_COMMAND', 'word_vout', 'Output Voltage (VOUT)', 'Target output voltage command setpoint (V)'),
+    (0x22, 'VOUT_TRIM', 'word_vout', 'Output Voltage (VOUT)', 'Fine trimming offset for output voltage (V)'),
+    (0x23, 'VOUT_CAL_OFFSET', 'word_vout', 'Output Voltage (VOUT)', 'Output voltage calibration offset (V)'),
+    (0x24, 'VOUT_MAX', 'word_vout', 'Output Voltage (VOUT)', 'Upper safety clamp limit for VOUT (V)'),
+    (0x25, 'VOUT_MARGIN_HIGH', 'word_vout', 'Output Voltage (VOUT)', 'Target voltage for high margin testing (V)'),
+    (0x26, 'VOUT_MARGIN_LOW', 'word_vout', 'Output Voltage (VOUT)', 'Target voltage for low margin testing (V)'),
+    (0x27, 'VOUT_TRANSITION_RATE', 'word_v_ms', 'Output Voltage (VOUT)', 'Output voltage slew rate during transitions (V/ms)'),
+    (0x28, 'VOUT_DROOP', 'word_droop', 'Output Voltage (VOUT)', 'Active voltage positioning loadline slope (mV/A)'),
+    (0x29, 'VOUT_SCALE_LOOP', 'word_linear_ratio', 'Output Voltage (VOUT)', 'Feedback divider scaling ratio'),
+    (0x40, 'VOUT_OV_FAULT_LIMIT', 'word_vout', 'Output Voltage (VOUT)', 'Output Overvoltage Fault shutdown threshold (V)'),
+    (0x41, 'VOUT_OV_FAULT_RESPONSE', 'byte_resp', 'Output Voltage (VOUT)', 'Response profile for VOUT Overvoltage Fault'),
+    (0x42, 'VOUT_OV_WARN_LIMIT', 'word_vout', 'Output Voltage (VOUT)', 'Output Overvoltage Warning advisory threshold (V)'),
+    (0x43, 'VOUT_UV_WARN_LIMIT', 'word_vout', 'Output Voltage (VOUT)', 'Output Undervoltage Warning advisory threshold (V)'),
+    (0x44, 'VOUT_UV_FAULT_LIMIT', 'word_vout', 'Output Voltage (VOUT)', 'Output Undervoltage Fault shutdown threshold (V)'),
+    (0x45, 'VOUT_UV_FAULT_RESPONSE', 'byte_resp', 'Output Voltage (VOUT)', 'Response profile for VOUT Undervoltage Fault'),
+    (0x5E, 'POWER_GOOD_ON', 'word_vout', 'Output Voltage (VOUT)', 'Output voltage threshold for Power Good assertion (V)'),
+    (0x5F, 'POWER_GOOD_OFF', 'word_vout', 'Output Voltage (VOUT)', 'Output voltage threshold for Power Good deassertion (V)'),
+    (0x8B, 'READ_VOUT', 'word_vout', 'Output Voltage (VOUT)', 'Real-time measured output voltage (V)'),
+    (0x60, 'TON_DELAY', 'word_ms', 'Sequencing & Timings', 'Turn-on delay time from enable to ramp (ms)'),
+    (0x61, 'TON_RISE', 'word_ms', 'Sequencing & Timings', 'Turn-on rise / soft-start ramp time (ms)'),
+    (0x62, 'TON_MAX_FAULT_LIMIT', 'word_ms', 'Sequencing & Timings', 'Maximum allowed turn-on transition time (ms)'),
+    (0x63, 'TON_MAX_FAULT_RESPONSE', 'byte_resp', 'Sequencing & Timings', 'Response profile for TON Max Fault'),
+    (0x64, 'TOFF_DELAY', 'word_ms', 'Sequencing & Timings', 'Turn-off delay time (ms)'),
+    (0x65, 'TOFF_FALL', 'word_ms', 'Sequencing & Timings', 'Turn-off ramp-down fall time (ms)'),
+    (0x66, 'TOFF_MAX_WARN_LIMIT', 'word_ms', 'Sequencing & Timings', 'Turn-off maximum warning limit (ms)'),
+    (0x31, 'POUT_MAX', 'word_power', 'Current & Power (IOUT)', 'Maximum continuous output power rating (W)'),
+    (0x38, 'IOUT_CAL_GAIN', 'word_mohm', 'Current & Power (IOUT)', 'Current sense shunt resistance (mOhm)'),
+    (0x39, 'IOUT_CAL_OFFSET', 'word_curr', 'Current & Power (IOUT)', 'Output current calibration offset (A)'),
+    (0x46, 'IOUT_OC_FAULT_LIMIT', 'word_curr', 'Current & Power (IOUT)', 'Output Overcurrent Fault shutdown threshold (A)'),
+    (0x47, 'IOUT_OC_FAULT_RESPONSE', 'byte_resp', 'Current & Power (IOUT)', 'Response profile for Output Overcurrent Fault'),
+    (0x48, 'IOUT_OC_LV_FAULT_LIMIT', 'word_vout', 'Current & Power (IOUT)', 'Output Overcurrent Low-Voltage shutdown threshold (V)'),
+    (0x49, 'IOUT_OC_LV_FAULT_RESPONSE', 'byte_resp', 'Current & Power (IOUT)', 'Response profile for OC Low-Voltage Fault'),
+    (0x4A, 'IOUT_OC_WARN_LIMIT', 'word_curr', 'Current & Power (IOUT)', 'Output Overcurrent Warning advisory threshold (A)'),
+    (0x4B, 'IOUT_UC_FAULT_LIMIT', 'word_curr', 'Current & Power (IOUT)', 'Output Undercurrent Fault shutdown threshold (A)'),
+    (0x4C, 'IOUT_UC_FAULT_RESPONSE', 'byte_resp', 'Current & Power (IOUT)', 'Response profile for Output Undercurrent Fault'),
+    (0x68, 'POUT_OP_FAULT_LIMIT', 'word_power', 'Current & Power (IOUT)', 'Output Overpower Fault shutdown threshold (W)'),
+    (0x69, 'POUT_OP_FAULT_RESPONSE', 'byte_resp', 'Current & Power (IOUT)', 'Response profile for Output Overpower Fault'),
+    (0x6A, 'POUT_OP_WARN_LIMIT', 'word_power', 'Current & Power (IOUT)', 'Output Overpower Warning advisory threshold (W)'),
+    (0x8C, 'READ_IOUT', 'word_curr', 'Current & Power (IOUT)', 'Real-time measured output current (A)'),
+    (0x96, 'READ_POUT', 'word_power', 'Current & Power (IOUT)', 'Real-time measured output power (W)'),
+    (0x4F, 'OT_FAULT_LIMIT', 'word_temp', 'Thermal & Cooling', 'Overtemperature Fault shutdown threshold (deg C)'),
+    (0x50, 'OT_FAULT_RESPONSE', 'byte_resp', 'Thermal & Cooling', 'Response profile for Overtemperature Fault'),
+    (0x51, 'OT_WARN_LIMIT', 'word_temp', 'Thermal & Cooling', 'Overtemperature Warning advisory threshold (deg C)'),
+    (0x52, 'UT_WARN_LIMIT', 'word_temp', 'Thermal & Cooling', 'Undertemperature Warning advisory threshold (deg C)'),
+    (0x53, 'UT_FAULT_LIMIT', 'word_temp', 'Thermal & Cooling', 'Undertemperature Fault shutdown threshold (deg C)'),
+    (0x54, 'UT_FAULT_RESPONSE', 'byte_resp', 'Thermal & Cooling', 'Response profile for Undertemperature Fault'),
+    (0x3A, 'FAN_CONFIG_1_2', 'byte_hex', 'Thermal & Cooling', 'Fan 1 and 2 configuration parameters'),
+    (0x3B, 'FAN_COMMAND_1', 'word_rpm', 'Thermal & Cooling', 'Fan 1 speed command setpoint (RPM or %)'),
+    (0x3C, 'FAN_COMMAND_2', 'word_rpm', 'Thermal & Cooling', 'Fan 2 speed command setpoint (RPM or %)'),
+    (0x8D, 'READ_TEMPERATURE_1', 'word_temp', 'Thermal & Cooling', 'Primary power stage temperature reading (deg C)'),
+    (0x8E, 'READ_TEMPERATURE_2', 'word_temp', 'Thermal & Cooling', 'Secondary / Synchronous rectifier temperature (deg C)'),
+    (0x8F, 'READ_TEMPERATURE_3', 'word_temp', 'Thermal & Cooling', 'Ambient / Air intake temperature reading (deg C)'),
+    (0x90, 'READ_FAN_SPEED_1', 'word_rpm', 'Thermal & Cooling', 'Measured speed of cooling fan 1 (RPM)'),
+    (0x91, 'READ_FAN_SPEED_2', 'word_rpm', 'Thermal & Cooling', 'Measured speed of cooling fan 2 (RPM)'),
+    (0x32, 'MAX_DUTY', 'word_percent', 'Regulation & Timing', 'Maximum permitted PWM duty cycle (%)'),
+    (0x33, 'FREQUENCY_SWITCH', 'word_khz', 'Regulation & Timing', 'Target switching frequency (kHz)'),
+    (0x94, 'READ_DUTY_CYCLE', 'word_percent', 'Regulation & Timing', 'Measured PWM duty cycle (%)'),
+    (0x95, 'READ_FREQUENCY', 'word_khz', 'Regulation & Timing', 'Measured switching frequency (kHz)'),
+    (0x78, 'STATUS_BYTE', 'byte_hex', 'Status & Diagnostics', 'Summary status byte (critical faults)'),
+    (0x79, 'STATUS_WORD', 'word_hex', 'Status & Diagnostics', 'Full 16-bit status word'),
+    (0x7A, 'STATUS_VOUT', 'byte_hex', 'Status & Diagnostics', 'Output voltage faults detail'),
+    (0x7B, 'STATUS_IOUT', 'byte_hex', 'Status & Diagnostics', 'Output current and power faults detail'),
+    (0x7C, 'STATUS_INPUT', 'byte_hex', 'Status & Diagnostics', 'Input voltage and current faults detail'),
+    (0x7D, 'STATUS_TEMPERATURE', 'byte_hex', 'Status & Diagnostics', 'Thermal faults detail'),
+    (0x7E, 'STATUS_CML', 'byte_hex', 'Status & Diagnostics', 'I2C, CRC/PEC, memory and command errors'),
+    (0x80, 'STATUS_MFR_SPECIFIC', 'byte_hex', 'Status & Diagnostics', 'Manufacturer proprietary diagnostic flags'),
+    (0x81, 'STATUS_FANS_1_2', 'byte_hex', 'Status & Diagnostics', 'Cooling fans 1 and 2 fault status'),
+    (0x98, 'PMBUS_REVISION', 'byte_hex', 'Manufacturer Info', 'Supported PMBus specification revision code'),
+    (0x99, 'MFR_ID', 'block_ascii', 'Manufacturer Info', 'Power supply manufacturer identity string'),
+    (0x9A, 'MFR_MODEL', 'block_ascii', 'Manufacturer Info', 'Equipment commercial model number string'),
+    (0x9B, 'MFR_REVISION', 'block_ascii', 'Manufacturer Info', 'Hardware revision / firmware build string'),
+    (0x9C, 'MFR_LOCATION', 'block_ascii', 'Manufacturer Info', 'Manufacturing facility location'),
+    (0x9D, 'MFR_DATE', 'block_ascii', 'Manufacturer Info', 'Manufacturing date code (YYMMDD)'),
+    (0x9E, 'MFR_SERIAL', 'block_ascii', 'Manufacturer Info', 'Unique device serial number'),
+    (0xA0, 'MFR_VIN_MIN', 'word_volt', 'Manufacturer Info', 'Minimum guaranteed input operating voltage (V)'),
+    (0xA1, 'MFR_VIN_MAX', 'word_volt', 'Manufacturer Info', 'Maximum guaranteed input operating voltage (V)'),
+    (0xA2, 'MFR_IIN_MAX', 'word_curr', 'Manufacturer Info', 'Maximum rated input current (A)'),
+    (0xA3, 'MFR_PIN_MAX', 'word_power', 'Manufacturer Info', 'Maximum rated input power (W)'),
+    (0xA4, 'MFR_VOUT_MIN', 'word_vout', 'Manufacturer Info', 'Minimum adjustable output voltage (V)'),
+    (0xA5, 'MFR_VOUT_MAX', 'word_vout', 'Manufacturer Info', 'Maximum adjustable output voltage (V)'),
+    (0xA6, 'MFR_IOUT_MAX', 'word_curr', 'Manufacturer Info', 'Maximum continuous rated output current (A)'),
+    (0xA7, 'MFR_POUT_MAX', 'word_power', 'Manufacturer Info', 'Maximum continuous rated output power (W)'),
+    (0xA8, 'MFR_TAMBIENT_MAX', 'word_temp', 'Manufacturer Info', 'Maximum rated ambient temperature (deg C)'),
+    (0xA9, 'MFR_TAMBIENT_MIN', 'word_temp', 'Manufacturer Info', 'Minimum rated ambient temperature (deg C)'),
+]
+
+REG_UNITS = {"word_volt": ("V", 3), "word_curr": ("A", 2), "word_power": ("W", 2), "word_temp": ("°C", 2),
+             "word_rpm": ("rpm", 0), "word_mohm": ("mΩ", 3), "word_droop": ("mV/A", 4), "word_v_ms": ("V/ms", 4),
+             "word_ms": ("ms", 2), "word_percent": ("%", 1), "word_khz": ("kHz", 1), "word_linear_ratio": ("", 4)}
+
+
+def decode_register(rtype, raw, vmode):
+    """Valeur brute -> texte lisible selon le type du registre."""
+    if raw is None:
+        return "n/a"
+    if rtype == "byte_resp":
+        act = ["Ignorer", "Continuer avec délai", "Arrêt jusqu'à effacement", "Nouvelle tentative"][(raw >> 6) & 3]
+        return "%s (0x%02X)" % (act, raw)
+    if rtype == "byte_vmode":
+        exp = vmode & 0x1F
+        return "Linear16, exposant %d (0x%02X)" % (exp - 32 if exp > 15 else exp, raw) if raw >> 5 == 0 else "0x%02X" % raw
+    if rtype == "byte_op":
+        names = {0x80: "ON", 0x00: "OFF immédiat", 0x40: "OFF progressif", 0x98: "ON (marge haute)", 0x94: "ON (marge basse)"}
+        return "%s (0x%02X)" % (names.get(raw, "?"), raw)
+    if rtype == "byte_cap":
+        return "%s0x%02X : PEC %s, %s, SMBALERT# %s" % ("", raw, "oui" if raw & 0x80 else "non",
+                                                         "400 kHz" if (raw >> 5) & 3 == 1 else "100 kHz",
+                                                         "oui" if raw & 0x10 else "non")
+    if rtype == "byte_page":
+        return "0x%02X (toutes)" % raw if raw == 0xFF else "0x%02X (page %d)" % (raw, raw)
+    if rtype in ("byte_hex", "byte_onoff", "byte_wp"):
+        return "0x%02X" % raw
+    if rtype == "word_hex":
+        return "0x%04X" % raw
+    if rtype == "word_vout":
+        if vmode is not None and vmode >> 5 == 0:
+            return "%.3f V" % decode_linear16(raw, vmode)
+        return "0x%04X" % raw
+    if rtype in REG_UNITS:
+        unit, dec = REG_UNITS[rtype]
+        return ("%.*f %s" % (dec, decode_linear11(raw), unit)).strip()
+    return "0x%04X" % raw
+
+
+def read_registers(bus, psu):
+    """Lit tous les registres de la table REGISTERS (à la demande, pas dans la boucle de mesure)."""
+    old, bus.retries = bus.retries, 1
+    try:
+        vmode = safe(bus.read_byte_data, psu.addr, CMD_VOUT_MODE)
+        out = []
+        for code, name, rtype, cat, desc in REGISTERS:
+            if rtype == "block_ascii":
+                val = read_text(bus, psu.addr, code) or "n/a"
+            elif rtype.startswith("byte"):
+                val = decode_register(rtype, safe(bus.read_byte_data, psu.addr, code), vmode)
+            else:
+                val = decode_register(rtype, safe(bus.read_word_data, psu.addr, code), vmode)
+            out.append({"code": "0x%02X" % code, "name": name, "cat": cat, "desc": desc, "val": val})
+        return out
+    finally:
+        bus.retries = old
+
+
+def do_control(bus, psu, action):
+    """Actions d'écriture (uniquement avec --control)."""
+    a = psu.addr
+    if action == "clear_faults":
+        try:
+            bus.write_byte(a, 0x03)                    # CLEAR_FAULTS (send byte)
+        except OSError:
+            bus.write_byte_data(a, 0x03, 0x00)
+    elif action == "on":
+        bus.write_byte_data(a, CMD_OPERATION, 0x80)
+    elif action == "off":
+        bus.write_byte_data(a, CMD_OPERATION, 0x00)
+    else:
+        raise ValueError("action inconnue : %s" % action)
+
+
 def decode_linear11(raw):
     exp = raw >> 11
     if exp > 15:
@@ -345,6 +691,14 @@ def read_text(bus, addr, cmd):
 
 
 def first_contact(bus, psu):
+    old, bus.retries = bus.retries, 1   # commandes non supportées : inutile d'insister
+    try:
+        _first_contact(bus, psu)
+    finally:
+        bus.retries = old
+
+
+def _first_contact(bus, psu):
     """Identifie le PSU et détermine les commandes qu'il supporte (une seule fois)."""
     a = psu.addr
     cml_before = safe(bus.read_byte_data, a, CMD_STATUS_CML)
@@ -402,7 +756,14 @@ def read_psu(bus, psu):
     try:
         if psu.page is not None:
             bus.write_byte_data(a, CMD_PAGE, psu.page)
-        sw = bus.read_word_data(a, CMD_STATUS_WORD)
+        try:
+            sw = bus.read_word_data(a, CMD_STATUS_WORD)
+        except OSError:   # certains PSU n'ont que STATUS_BYTE ; sinon READ_VOUT prouve qu'ils sont là
+            try:
+                sw = bus.read_byte_data(a, 0x78)
+            except OSError:
+                bus.read_word_data(a, 0x8B)
+                sw = 0
     except OSError as e:
         psu.reset()
         res.update(summary="offline", online=False,
@@ -476,6 +837,7 @@ class BusWorker:
         self.psus = psus
         self.bus = I2CBus(bus_num)
         self.cur = None   # (mux, canal) actuellement sélectionné
+        self.lock = threading.RLock()   # un seul accès à la fois : mesures, registres, actions
 
     def _select(self, psu):
         want = (psu.mux, psu.channel) if psu.mux is not None else None
@@ -496,7 +858,22 @@ class BusWorker:
             safe(self.bus.write_byte, self.cur[0], 0)
             self.cur = None
 
+    def run(self, psu, fn):
+        """Exécute fn(bus) sur ce PSU (mux sélectionné, page positionnée), sans gêner les mesures."""
+        with self.lock:
+            try:
+                self._select(psu)
+                if psu.page is not None:
+                    self.bus.write_byte_data(psu.addr, CMD_PAGE, psu.page)
+                return fn(self.bus)
+            finally:
+                self.deselect()
+
     def poll(self):
+        with self.lock:
+            return self._poll()
+
+    def _poll(self):
         out = []
         for psu in self.psus:
             try:
@@ -518,9 +895,13 @@ class BusWorker:
 def scan_bus(bus):
     """Adresses qui répondent (lecture d'octet, comme i2cdetect ; repli sur STATUS_WORD)."""
     found = []
-    for a in range(0x03, 0x78):
-        if safe(bus.read_byte, a) is not None or safe(bus.read_word_data, a, CMD_STATUS_WORD) is not None:
-            found.append(a)
+    old, bus.retries = bus.retries, 0
+    try:
+        for a in range(0x03, 0x78):
+            if safe(bus.read_byte, a) is not None or safe(bus.read_word_data, a, CMD_STATUS_WORD) is not None:
+                found.append(a)
+    finally:
+        bus.retries = old
     return found
 
 
@@ -529,20 +910,25 @@ def hexl(addrs):
 
 
 def looks_like_pmbus(bus, addr):
-    """Un périphérique est pris pour un PSU PMBus s'il lit STATUS_WORD et confirme par d'autres commandes."""
-    if safe(bus.read_word_data, addr, CMD_STATUS_WORD) is None:
+    """Critères repris d'un outil qui marche sur le terrain : STATUS_BYTE lisible (≠ 0xFF),
+    puis au moins une autre lecture PMBus cohérente (READ_VOUT / READ_VIN / PMBUS_REVISION / VOUT_MODE)."""
+    st = safe(bus.read_byte_data, addr, 0x78)            # STATUS_BYTE
+    if st is None:
+        st = safe(bus.read_word_data, addr, CMD_STATUS_WORD)
+        st = None if st is None else st & 0xFF
+    if st is None or st == 0xFF:
         return False
-    score = 0
+    vout = safe(bus.read_word_data, addr, 0x8B)
+    vin = safe(bus.read_word_data, addr, 0x88)
     rev = safe(bus.read_byte_data, addr, CMD_PMBUS_REVISION)
-    if rev is not None and (rev >> 4) <= 4 and (rev & 0xF) <= 4:
-        score += 1
-    for cmd in (CMD_VOUT_MODE, CMD_CAPABILITY):
-        if safe(bus.read_byte_data, addr, cmd) is not None:
-            score += 1
-    for cmd in (0x88, 0x8B, 0x8C, 0x8D):   # READ_VIN / VOUT / IOUT / TEMPERATURE_1
-        if safe(bus.read_word_data, addr, cmd) is not None:
-            score += 1
-    return score >= 2
+    vmode = safe(bus.read_byte_data, addr, CMD_VOUT_MODE)
+    good = [vout is not None and vout not in (0xFFFF, 0x7FFF),
+            vin is not None and vin not in (0xFFFF, 0x7FFF),
+            rev is not None and (rev >> 4) <= 4 and (rev & 0xF) <= 4,
+            vmode is not None and vmode != 0xFF]
+    if not any(good):
+        return False
+    return not (st == 0 and not vout and not vin)        # tout à zéro = périphérique fantôme
 
 
 def is_mux(bus, addr):
@@ -556,17 +942,35 @@ def is_mux(bus, addr):
         return False
 
 
+PSU_RANGE = range(0x58, 0x68)   # adresses habituelles des PSU PMBus (EEPROM FRU en 0x50-0x57)
+
+
 def discover(args, report=True):
-    """Balaye tous les bus I2C (ou celui demandé avec -b), les mux du PDB et toutes les adresses.
+    """Balaye les bus I2C (tous, ou celui demandé avec -b), les mux du PDB et les adresses.
     Renvoie la liste des PSU PMBus trouvés."""
     say = print if report else (lambda *a, **k: None)
-    nums = [args.bus] if args.bus_explicit else sorted(
-        int(f.split("-")[1]) for f in os.listdir("/dev") if f.startswith("i2c-") and f.split("-")[1].isdigit())
+    if args.bus_explicit:
+        nums = [args.bus]
+    else:   # le bus 0 de la BBB est interne (PMIC, EEPROM) : ignoré sauf avec -b 0
+        nums = sorted(n for n in (int(f.split("-")[1]) for f in os.listdir("/dev")
+                                  if f.startswith("i2c-") and f.split("-")[1].isdigit()) if n > 0)
     if not nums:
-        say("Aucun /dev/i2c-* : active le bus I2C (overlay / config-pin) et vérifie les droits.")
+        say("Aucun /dev/i2c-N (N>0) : active le bus I2C (config-pin / overlay) et vérifie les droits.")
         return []
     say("Bus I2C à balayer : %s" % ", ".join(map(str, nums)))
     psus = []
+
+    def check(bus, num, addrs, mux=None, ch=None):
+        for a in sorted(addrs):
+            if args.addr is not None and a not in args.addr:
+                continue
+            where = "direct" if mux is None else "mux 0x%02X canal %d" % (mux, ch)
+            if looks_like_pmbus(bus, a):
+                psus.append(Psu("PSU%d" % (len(psus) + 1), num, a, mux, ch))
+                say("  -> PSU PMBus en 0x%02X (%s)" % (a, where))
+            elif a in seen:
+                say("  0x%02X (%s) répond mais n'est pas reconnu comme PMBus" % (a, where))
+
     for num in nums:
         try:
             bus = I2CBus(num)
@@ -574,40 +978,29 @@ def discover(args, report=True):
             say("Bus %d : ouverture impossible (%s)" % (num, e))
             continue
         try:
-            # 1) mux : on les repère et on les remet à zéro avant tout balayage direct
+            say("Bus %d (pilote %s) :" % (num, bus.backend))
             cands = [args.mux] if args.mux is not None else [a for a in range(0x70, 0x78)
                                                               if safe(bus.read_byte, a) is not None]
-            muxes = [m for m in cands if is_mux(bus, m)]
+            muxes = [m for m in cands if is_mux(bus, m)]       # remis à 0 par is_mux
             direct = scan_bus(bus)
-            say("Bus %d : %s" % (num, hexl(direct)))
+            say("  adresses qui répondent : %s" % hexl(direct))
             if muxes:
                 say("  mux I2C détecté(s) : %s" % hexl(muxes))
             skip = set(muxes) | set(range(0x50, 0x58))   # mux et EEPROM FRU : pas des PSU
-            for a in direct:
-                if (args.addr is None or a in args.addr) and a not in skip:
-                    if looks_like_pmbus(bus, a):
-                        psus.append(Psu("PSU%d" % (len(psus) + 1), num, a))
-                        say("  -> PSU PMBus en 0x%02X (direct)" % a)
-                    else:
-                        say("  0x%02X répond mais n'est pas reconnu comme PMBus" % a)
-            # 2) derrière chaque mux, canal par canal
+            seen = set(direct)
+            # on sonde 0x58-0x67 même si le balayage ne les a pas vues (certains PSU ignorent l'octet seul)
+            check(bus, num, (set(direct) | set(PSU_RANGE)) - skip)
             for m in muxes:
-                chans = args.channels if args.mux is not None else range(8)
-                for ch in chans:
+                for ch in (args.channels if args.mux is not None else range(8)):
                     try:
                         bus.write_byte(m, 1 << ch)
                     except OSError:
                         continue
                     found = [a for a in scan_bus(bus) if a != m]
+                    seen = set(found)
                     if found:
                         say("  mux 0x%02X canal %d : %s" % (m, ch, hexl(found)))
-                    for a in found:
-                        if (args.addr is None or a in args.addr) and a not in skip and a not in muxes:
-                            if looks_like_pmbus(bus, a):
-                                psus.append(Psu("PSU%d" % (len(psus) + 1), num, a, m, ch))
-                                say("  -> PSU PMBus en 0x%02X (mux 0x%02X canal %d)" % (a, m, ch))
-                            else:
-                                say("  0x%02X (canal %d) répond mais n'est pas reconnu comme PMBus" % (a, ch))
+                    check(bus, num, (set(found) | set(PSU_RANGE)) - skip - set(muxes), m, ch)
                 safe(bus.write_byte, m, 0)
         finally:
             bus.close()
@@ -675,17 +1068,42 @@ def unique_names(psus):
 class State:
     def __init__(self, psus, interval, history_s):
         self.lock = threading.Lock()
-        self.order = [p.name for p in psus]
         self.interval = interval
-        self.latest = {}
-        self.hist = {p.name: {} for p in psus}
-        self.maxlen = max(120, int(history_s / max(interval, 0.2)))
+        self.history_s = history_s
         self.events = collections.deque(maxlen=1000)
         self.seq = 0
+        self.reset(psus)
+
+    def reset(self, psus):
+        with self.lock:
+            self.order = [p.name for p in psus]
+            self.latest = {}
+            self.hist = {p.name: {} for p in psus}
+            self.maxlen = max(120, int(self.history_s / max(self.interval, 0.2)))
+
+    def export_csv(self):
+        out = io.StringIO()
+        w = csv.writer(out)
+        w.writerow(["time", "psu"] + TELEMETRY_KEYS)
+        with self.lock:
+            for name, series in self.hist.items():
+                rows = {}
+                for k, dq in series.items():
+                    for t, v in dq:
+                        rows.setdefault(round(t, 2), {})[k] = v
+                for t in sorted(rows):
+                    r = rows[t]
+                    w.writerow([time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t)), name]
+                               + [("%.3f" % r[k]) if k in r else "" for k in TELEMETRY_KEYS])
+        return out.getvalue()
 
     def _event(self, t, psu, sev, msg):
         self.seq += 1
         self.events.append({"id": self.seq, "t": t, "psu": psu, "sev": sev, "msg": msg})
+
+    def log(self, psu, sev, msg):
+        with self.lock:
+            self._event(time.time(), psu, sev, msg)
 
     def update(self, results):
         with self.lock:
@@ -781,12 +1199,18 @@ select,label{font:inherit;color:var(--fg)}select{background:var(--card);border:1
 .ch{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:10px}
 .ch h3{margin:0 0 4px}.ch canvas{width:100%;height:190px;display:block}
 .empty{color:var(--mut);padding:20px;text-align:center}
+.btn{background:var(--acc);color:#fff;border:0;border-radius:6px;padding:6px 12px;font:inherit;font-size:13px;cursor:pointer}
+.btn.gray{background:var(--card);color:var(--fg);border:1px solid var(--bd)}.btn.red{background:var(--fault)}.btn.green{background:var(--ok)}
+.btn:disabled{opacity:.5;cursor:wait}.acts{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+a.btn{text-decoration:none;display:inline-block}input[type=search]{font:inherit;color:var(--fg);background:var(--card);border:1px solid var(--bd);border-radius:6px;padding:5px 8px}
+.sim{background:var(--warn);color:#fff;font-size:12px;padding:2px 8px;border-radius:6px}
 </style></head><body>
-<header><h1>PMBus Monitor</h1><span id="summary"></span><span id="meta">chargement…</span></header>
+<header><h1>PMBus Monitor</h1><span id="summary"></span><span id="sim"></span><button class="btn gray" id="rescan" title="Relancer la détection des bus, mux et PSU">↻ Rescanner</button><span id="meta">chargement…</span></header>
 <nav id="tabs">
  <button data-tab="overview" class="on">Vue d'ensemble</button>
  <button data-tab="details">Détails &amp; codes d'erreur</button>
  <button data-tab="graphs">Graphiques</button>
+ <button data-tab="registers">Registres</button>
  <button data-tab="events">Journal</button>
 </nav>
 <main>
@@ -797,8 +1221,13 @@ select,label{font:inherit;color:var(--fg)}select{background:var(--card);border:1
   <div class="bar"><label>Période : <select id="range">
     <option value="300">5 min</option><option value="900">15 min</option>
     <option value="1800">30 min</option><option value="3600" selected>1 h</option></select></label>
-   <span id="legend"></span></div>
+   <span id="legend"></span><a class="btn gray" href="api/export.csv">⬇ Exporter CSV</a></div>
   <div id="charts"></div></section>
+ <section id="tab-registers" hidden>
+  <div class="bar"><label>PSU : <select id="rsel"></select></label>
+   <button class="btn" id="rread">Lire les registres</button>
+   <input type="search" id="rfilter" placeholder="filtrer (nom, code, catégorie)…"><span id="rstat" style="color:var(--mut);font-size:13px"></span></div>
+  <div id="regs" class="panel"><div class="empty">Choisis un PSU puis « Lire les registres » (lecture complète, quelques secondes).</div></div></section>
  <section id="tab-events" hidden><div class="panel"><table id="events"></table></div></section>
 </main>
 <script>
@@ -812,6 +1241,38 @@ const hex=(v,n)=>"0x"+v.toString(16).toUpperCase().padStart(n,"0");
 const names=()=>data?data.psus.map(p=>p.name):[];
 const color=n=>COLORS[names().indexOf(n)%COLORS.length];
 
+async function post(url,body){
+  const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json","X-Requested-With":"pmbus-monitor"},body:JSON.stringify(body||{})});
+  const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||("HTTP "+r.status));return j;
+}
+$("rescan").onclick=async e=>{
+  const b=e.target;b.disabled=true;b.textContent="Détection…";
+  try{const j=await post("api/rescan");hist={};histSince=0;histLoaded=false;chartKey="";events=[];evId=0;
+    $("meta").textContent=j.psus+" PSU détecté(s)"}catch(x){alert("Rescan impossible : "+x.message)}
+  b.disabled=false;b.textContent="↻ Rescanner";
+};
+let regRows=[];
+function renderRegs(){
+  const f=$("rfilter").value.toLowerCase(),rows=regRows.filter(r=>!f||(r.name+r.code+r.cat+r.desc).toLowerCase().includes(f));
+  if(!regRows.length)return;
+  const cats={};rows.forEach(r=>(cats[r.cat]=cats[r.cat]||[]).push(r));
+  $("regs").innerHTML=Object.entries(cats).map(([c,rs])=>`<h3>${esc(c)}</h3><table><tr><th>Code</th><th>Registre</th><th>Valeur</th><th>Description</th></tr>`+
+    rs.map(r=>`<tr><td><code>${r.code}</code></td><td><b>${esc(r.name)}</b></td><td class="n" style="text-align:left">${esc(r.val)}</td><td style="color:var(--mut)">${esc(r.desc)}</td></tr>`).join("")+`</table>`).join("")||'<div class="empty">Aucun résultat</div>';
+}
+$("rfilter").oninput=renderRegs;
+$("rread").onclick=async e=>{
+  const b=e.target;b.disabled=true;$("rstat").textContent="lecture en cours…";
+  try{const r=await fetch("api/registers?psu="+encodeURIComponent($("rsel").value),{cache:"no-store"}),j=await r.json();
+    if(!r.ok)throw new Error(j.error);regRows=j.registers;renderRegs();
+    $("rstat").textContent=regRows.filter(x=>x.val!=="n/a").length+" / "+regRows.length+" registres supportés — "+new Date().toLocaleTimeString()}
+  catch(x){$("rstat").textContent="erreur : "+x.message}
+  b.disabled=false;
+};
+async function act(psu,action){
+  const txt={clear_faults:"Effacer les défauts mémorisés",on:"Mettre en MARCHE (OPERATION=0x80)",off:"ÉTEINDRE la sortie (OPERATION=0x00)"}[action];
+  if(!confirm(txt+" sur "+psu+" ?"))return;
+  try{await post("api/action",{psu,action});tick(true)}catch(x){alert("Échec : "+x.message)}
+}
 document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>{
   tab=b.dataset.tab;
   document.querySelectorAll("#tabs button").forEach(x=>x.classList.toggle("on",x===b));
@@ -860,6 +1321,7 @@ function detail(p){
   let h=`<div class="panel"><div class="top"><h2 style="margin:0">${esc(p.name)}</h2><span class="pill ${p.summary}">${SEV[p.summary]}</span></div><div class="loc">${esc(p.loc)}</div>`;
   if(!p.online)return h+`<div class="err">${esc(p.error||"")}</div></div>`;
   const M=data.metrics;
+  if(data.control)h+=`<div class="acts"><button class="btn gray" data-a="clear_faults" data-p="${esc(p.name)}">Effacer les défauts</button><button class="btn green" data-a="on" data-p="${esc(p.name)}">ON</button><button class="btn red" data-a="off" data-p="${esc(p.name)}">OFF</button></div>`;
   h+=`<h3>Alarmes actives</h3>`;
   if(!p.alarms.length&&!p.word_flags.filter(f=>f.name!=="OFF").length)h+=`<div class="ok-line">Aucune alarme</div>`;
   else if(!p.alarms.length)h+=`<div class="ok-line">Aucun détail dans les registres STATUS_* — voir STATUS_WORD ci-dessous</div>`;
@@ -888,7 +1350,12 @@ function renderDetails(){
   if($("sel").innerHTML!==opts)$("sel").innerHTML=opts;
   $("sel").value=sel;
   $("detail").innerHTML=data.psus.filter(p=>sel==="all"||p.name===sel).filter(p=>p.summary!=="pending").map(detail).join("");
+  document.querySelectorAll("#detail [data-a]").forEach(b=>b.onclick=()=>act(b.dataset.p,b.dataset.a));
   document.querySelectorAll("#detail details").forEach(d=>d.ontoggle=()=>d.open?openSec.add(d.dataset.k):openSec.delete(d.dataset.k));
+}
+function renderRegSel(){
+  const opts=data.psus.map(p=>`<option value="${esc(p.name)}">${esc(p.name)}</option>`).join("");
+  if($("rsel").dataset.o!==opts){const v=$("rsel").value;$("rsel").innerHTML=opts;$("rsel").dataset.o=opts;if(v)$("rsel").value=v}
 }
 function renderEvents(){
   $("events").innerHTML=`<tr><th>Heure</th><th>PSU</th><th>Gravité</th><th>Événement</th></tr>`+
@@ -988,8 +1455,10 @@ function render(){
   if(tab==="overview")renderOverview();
   if(tab==="details")renderDetails();
   if(tab==="events")renderEvents();
+  if(tab==="registers")renderRegSel();
+  $("sim").innerHTML=data.mock?'<span class="sim">SIMULATION</span>':"";
 }
-async function tick(){
+async function tick(once){
   try{
     const r=await fetch("api/data",{cache:"no-store"});
     if(r.status===401){location.reload();return}
@@ -1002,7 +1471,7 @@ async function tick(){
     render();
     if(histLoaded){await loadHist();if(tab==="graphs")drawCharts()}
   }catch(e){$("meta").textContent="connexion perdue…"}
-  setTimeout(tick,Math.max(1000,(data?data.interval:2)*1000));
+  if(!once)setTimeout(tick,Math.max(1000,(data?data.interval:2)*1000));
 }
 tick();
 </script></body></html>
@@ -1012,7 +1481,86 @@ tick();
 # --------------------------------------------------------------------------
 # Serveur HTTP(S)
 # --------------------------------------------------------------------------
-def make_handler(state, auth):
+class Monitor:
+    """Pilote les threads de lecture (un par bus) ; peut tout relancer après un nouveau balayage."""
+
+    def __init__(self, args, build):
+        self.args = args
+        self.build = build            # build(report) -> liste de PSU
+        self.state = State([], args.interval, args.history)
+        self.lock = threading.RLock()
+        self.csv_lock = threading.Lock()
+        self.psus, self.workers, self.threads = [], [], []
+        self.stop = threading.Event()
+
+    def start(self, psus):
+        with self.lock:
+            unique_names(psus)
+            self.psus = psus
+            self.state.reset(psus)
+            self.stop = threading.Event()
+            self.workers, self.threads = [], []
+            for b in sorted({x.bus for x in psus}):
+                mine = [x for x in psus if x.bus == b]
+                try:
+                    self.workers.append(BusWorker(b, mine))
+                except OSError as e:
+                    self.state.update([{"name": x.name, "loc": x.loc, "t": time.time(), "online": False,
+                                        "summary": "offline", "error": "bus %d inaccessible : %s" % (b, e)}
+                                       for x in mine])
+            self.threads = [threading.Thread(target=self._loop, args=(w, self.stop), daemon=True)
+                            for w in self.workers]
+            for t in self.threads:
+                t.start()
+
+    def halt(self):
+        with self.lock:
+            self.stop.set()
+            for t in self.threads:
+                t.join(timeout=self.args.interval + 5)
+            for w in self.workers:
+                w.close()
+            self.workers, self.threads = [], []
+
+    def rescan(self):
+        with self.lock:
+            self.halt()
+            self.start(self.build(False))
+            return self.psus
+
+    def _loop(self, w, stop):
+        while not stop.is_set():
+            t0 = time.time()
+            try:
+                results = w.poll()
+                self.state.update(results)
+                if self.args.csv:
+                    with self.csv_lock:
+                        write_csv(self.args.csv, results)
+            except Exception as e:   # un incident sur un bus ne doit pas tuer le thread
+                print("bus %d : %s" % (w.num, e), file=sys.stderr)
+            stop.wait(max(0.05, self.args.interval - (time.time() - t0)))
+
+    def _find(self, name):
+        for w in self.workers:
+            for p in w.psus:
+                if p.name == name:
+                    return w, p
+        raise KeyError(name)
+
+    def read_registers(self, name):
+        w, p = self._find(name)
+        return w.run(p, lambda bus: read_registers(bus, p))
+
+    def control(self, name, action):
+        w, p = self._find(name)
+        w.run(p, lambda bus: do_control(bus, p, action))
+        self.state.log(p.name, "warn", "Action manuelle : %s" % action)
+        p.reset()   # on relit tout au prochain cycle (limites, statuts)
+
+
+def make_handler(mon, auth, control):
+    state = mon.state
     defs_json = json.dumps(status_defs()).encode()
     page = HTML_PAGE.encode("utf-8")
 
@@ -1031,22 +1579,29 @@ def make_handler(state, auth):
                     pass
             return False
 
-        def _send(self, body, ctype, code=200):
+        def _send(self, body, ctype, code=200, extra=None):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
+            for k, v in (extra or {}).items():
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
 
+        def _json(self, obj, code=200):
+            self._send(json.dumps(obj).encode(), "application/json", code)
+
+        def _deny(self):
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="PMBus Monitor"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def do_GET(self):
             if not self._authorized():
-                self.send_response(401)
-                self.send_header("WWW-Authenticate", 'Basic realm="PMBus Monitor"')
-                self.send_header("Content-Length", "0")
-                self.end_headers()
-                return
+                return self._deny()
             u = urllib.parse.urlparse(self.path)
             q = urllib.parse.parse_qs(u.query)
 
@@ -1060,17 +1615,60 @@ def make_handler(state, auth):
                 self._send(page, "text/html; charset=utf-8")
             elif u.path == "/api/data":
                 snap = state.snapshot()
-                snap["metrics"] = METRICS_META
-                self._send(json.dumps(snap).encode(), "application/json")
+                snap.update(metrics=METRICS_META, control=control, backend=mon.backend,
+                            mock=bool(mon.args.mock))
+                self._json(snap)
             elif u.path == "/api/defs":
                 self._send(defs_json, "application/json")
             elif u.path == "/api/history":
-                self._send(json.dumps(state.history(num("since"))).encode(), "application/json")
+                self._json(state.history(num("since")))
             elif u.path == "/api/events":
-                self._send(json.dumps(state.events_since(int(num("since")))).encode(), "application/json")
+                self._json(state.events_since(int(num("since"))))
+            elif u.path == "/api/registers":
+                try:
+                    self._json({"registers": mon.read_registers(q.get("psu", [""])[0])})
+                except KeyError:
+                    self._json({"error": "PSU inconnu"}, 404)
+                except OSError as e:
+                    self._json({"error": "lecture impossible : %s" % (e.strerror or e)}, 502)
+            elif u.path == "/api/export.csv":
+                name = "pmbus_%s.csv" % time.strftime("%Y%m%d_%H%M%S")
+                self._send(state.export_csv().encode(), "text/csv; charset=utf-8",
+                           extra={"Content-Disposition": 'attachment; filename="%s"' % name})
             elif u.path == "/favicon.ico":
                 self.send_response(204)
                 self.end_headers()
+            else:
+                self.send_error(404)
+
+        def do_POST(self):
+            if not self._authorized():
+                return self._deny()
+            # protection CSRF : seul notre JavaScript envoie cet en-tête (un autre site ne le peut pas sans CORS)
+            if self.headers.get("X-Requested-With") != "pmbus-monitor":
+                return self._json({"error": "requête refusée"}, 403)
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(n) or b"{}")
+            except (ValueError, TypeError):
+                return self._json({"error": "JSON invalide"}, 400)
+            path = urllib.parse.urlparse(self.path).path
+            if path == "/api/rescan":
+                psus = mon.rescan()
+                print("Nouveau balayage : %d PSU" % len(psus), flush=True)
+                self._json({"psus": len(psus)})
+            elif path == "/api/action":
+                if not control:
+                    return self._json({"error": "actions désactivées (lancer avec --control)"}, 403)
+                try:
+                    mon.control(str(body.get("psu", "")), str(body.get("action", "")))
+                    self._json({"status": "ok"})
+                except KeyError:
+                    self._json({"error": "PSU inconnu"}, 404)
+                except ValueError as e:
+                    self._json({"error": str(e)}, 400)
+                except OSError as e:
+                    self._json({"error": "écriture impossible : %s" % (e.strerror or e)}, 502)
             else:
                 self.send_error(404)
 
@@ -1141,7 +1739,7 @@ def ensure_cert(certdir, regen=False):
     return crt, key
 
 
-def wait_first_poll(state, psus, timeout=15):
+def wait_first_poll(state, psus, timeout=20):
     end = time.time() + timeout
     while time.time() < end:
         with state.lock:
@@ -1150,7 +1748,7 @@ def wait_first_poll(state, psus, timeout=15):
         time.sleep(0.2)
 
 
-def print_banner(state, psus, workers, scheme, port, args):
+def print_banner(state, psus, workers, scheme, port, args, backend=""):
     ips = [args.host] if args.host != "0.0.0.0" else local_ips()
     host = socket.gethostname()
     line = "=" * 64
@@ -1172,6 +1770,9 @@ def print_banner(state, psus, workers, scheme, port, args):
     else:
         print(" Accès sans mot de passe (ajoute --auth utilisateur:motdepasse)")
     print(" Intervalle de lecture : %g s - historique : %d min" % (args.interval, args.history // 60))
+    print(" Pilote I2C : %s%s" % (backend, "" if backend != "ioctl" else "  (conseil : pip install smbus2)"))
+    if args.control:
+        print(" ACTIONS D'ÉCRITURE ACTIVÉES (effacer défauts, ON/OFF) - protégées par le mot de passe")
     print("-" * 64)
     print(" %d PSU, %d bus I2C :" % (len(psus), len(workers)))
     with state.lock:
@@ -1191,30 +1792,12 @@ def print_banner(state, psus, workers, scheme, port, args):
     print(" Ctrl+C pour arrêter\n", flush=True)
 
 
-def run_web(workers, psus, args):
-    state = State(psus, args.interval, args.history)
-    stop = threading.Event()
-    csv_lock = threading.Lock()
-
-    def loop(w):
-        while not stop.is_set():
-            t0 = time.time()
-            try:
-                results = w.poll()
-                state.update(results)
-                if args.csv:
-                    with csv_lock:
-                        write_csv(args.csv, results)
-            except Exception as e:   # un incident sur un bus ne doit pas tuer le thread
-                print("bus %d : %s" % (w.num, e), file=sys.stderr)
-            stop.wait(max(0.05, args.interval - (time.time() - t0)))
-
-    threads = [threading.Thread(target=loop, args=(w,), daemon=True) for w in workers]
-    for t in threads:
-        t.start()
-
+def run_web(psus, args, build):
+    mon = Monitor(args, build)
+    mon.backend = "simulation" if args.mock else ("smbus2" if _SMBus else "ioctl")
+    mon.start(psus)
     port = args.port or (8080 if args.http else 8443)
-    server = Server((args.host, port), make_handler(state, args.auth))
+    server = Server((args.host, port), make_handler(mon, args.auth, args.control))
     scheme = "http"
     if not args.http:
         if args.cert and args.key:
@@ -1226,17 +1809,27 @@ def run_web(workers, psus, args):
         ctx.load_cert_chain(crt, key)
         server.ctx = ctx
         scheme = "https"
-    wait_first_poll(state, psus)
-    print_banner(state, psus, workers, scheme, port, args)
+
+    def auto_rescan():   # tant qu'aucun PSU n'est trouvé, on retente toutes les 30 s (branchement à chaud)
+        while True:
+            time.sleep(30)
+            if not mon.psus:
+                try:
+                    if mon.rescan():
+                        print("PSU détecté(s) : %s" % ", ".join(p.name for p in mon.psus), flush=True)
+                except Exception as e:
+                    print("rescan : %s" % e, file=sys.stderr)
+
+    threading.Thread(target=auto_rescan, daemon=True).start()
+    wait_first_poll(mon.state, psus)
+    print_banner(mon.state, psus, mon.workers, scheme, port, args, mon.backend)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        stop.set()
         server.server_close()
-        for t in threads:
-            t.join(timeout=args.interval + 2)
+        mon.halt()
 
 
 # --------------------------------------------------------------------------
@@ -1328,6 +1921,7 @@ def main():
     p.add_argument("--info", action="store_true", help="terminal : afficher l'identité des PSU")
     p.add_argument("--json", action="store_true", help="sortie JSON (terminal)")
     p.add_argument("--csv", metavar="FICHIER", help="ajouter les mesures à un fichier CSV")
+    p.add_argument("--mock", action="store_true", help="simulation : 3 PSU fictifs sur le bus 2 (aucun matériel)")
     w = p.add_argument_group("interface web")
     p.add_argument("--terminal", action="store_true", help="affichage terminal au lieu de l'interface web")
     w.add_argument("--web", action="store_true", help="(défaut) servir l'interface web, HTTPS par défaut")
@@ -1341,6 +1935,8 @@ def main():
     w.add_argument("--regen-cert", action="store_true", help="régénérer le certificat auto-signé")
     w.add_argument("--auth", metavar="USER:MOT_DE_PASSE", default=os.environ.get("PMBUS_AUTH"),
                    help="protéger la page par mot de passe (ou variable PMBUS_AUTH)")
+    w.add_argument("--control", action="store_true",
+                   help="autoriser les actions d'écriture depuis la page (effacer défauts, ON/OFF) ; exige --auth")
     w.add_argument("--history", type=int, default=3600, help="durée d'historique gardée en mémoire, en s (défaut 3600)")
     args = p.parse_args()
     args.channels = parse_channels(args.channels)
@@ -1350,41 +1946,51 @@ def main():
     # L'interface web est le mode par défaut ; --once / --json / --terminal donnent le mode terminal.
     args.web = not (args.terminal or args.once or args.json)
 
+    if args.mock:
+        global I2CBus
+        I2CBus = MockBus
+        args.bus_explicit = True   # le simulateur n'existe que sur le bus choisi (2 par défaut)
+
     if args.scan:
         discover(args)
         return
 
+    if args.control and not (args.auth and args.web):
+        sys.exit("--control modifie le matériel : il exige --auth utilisateur:motdepasse (et l'interface web).")
+
     cfg_interval = None
+
+    def build(report=True):
+        if args.config:
+            return psus_from_config(args.config, args.bus)[0]
+        if args.autodetect or (args.addr is None and not args.pages):
+            return discover(args, report)
+        return psus_from_args(args)
+
     try:
         if args.config:
-            psus, cfg_interval = psus_from_config(args.config, args.bus)
-        elif args.autodetect or (args.addr is None and not args.pages):
-            psus = discover(args)
-        else:
-            psus = psus_from_args(args)
+            cfg_interval = psus_from_config(args.config, args.bus)[1]
+        psus = build()
     except (OSError, ValueError, KeyError) as e:
         sys.exit("Configuration impossible : %s" % e)
     args.interval = args.interval or cfg_interval or 2.0
     if not psus and not args.web:
         sys.exit("Aucun PSU trouvé. Lance --scan pour voir ce qui répond sur les bus.")
-    if psus and not args.web:
-        print("%d PSU : %s" % (len(psus), ", ".join("%s (%s)" % (x.name, x.loc) for x in psus)))
-    unique_names(psus)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
+    if args.web:
+        run_web(psus, args, build)
+        return
+
+    unique_names(psus)
+    print("%d PSU : %s" % (len(psus), ", ".join("%s (%s)" % (x.name, x.loc) for x in psus)))
     workers = []
     try:
         for b in sorted({x.bus for x in psus}):
             workers.append(BusWorker(b, [x for x in psus if x.bus == b]))
+        run_terminal(workers, args)
     except OSError as e:
-        sys.exit("Impossible d'ouvrir /dev/i2c-%d : %s\n"
-                 "Vérifie que le bus est activé (overlay) et que tu as les droits." % (b, e))
-
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    try:
-        if args.web:
-            run_web(workers, psus, args)
-        else:
-            run_terminal(workers, args)
+        sys.exit("Impossible d'ouvrir le bus I2C : %s\nVérifie que le bus est activé et les droits." % e)
     except KeyboardInterrupt:
         pass
     finally:

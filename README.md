@@ -16,20 +16,23 @@ PMBUS/
 
 ## Monitoring PMBus (BeagleBone Black)
 
-`pmbus_monitor.py` : un seul fichier, sans dépendance (Python 3 + `openssl` pour le certificat).
+`pmbus_monitor.py` : un seul fichier. Recommandé : `pip install smbus2` (sinon accès direct à `/dev/i2c-N`).
 
 ```
-./pmbus_monitor.py --scan                                        # cherche les périphériques
-./pmbus_monitor.py --autodetect                            # détecte les PSU 0x58-0x5F
-./pmbus_monitor.py --addr 0x58 0x59                        # PSU en direct
-./pmbus_monitor.py --mux 0x70 --channels 0-3 --addr 0x58   # via un PDB
-./pmbus_monitor.py --config psus.example.json --web --auth admin:secret   # multi-bus / multi-mux
+python3 pmbus_monitor.py                        # détecte tout (bus, mux, PSU) et ouvre la page web
+python3 pmbus_monitor.py --scan                 # rapport de détection seulement
+python3 pmbus_monitor.py -b 2 --addr 0x58 0x59  # forcer bus / adresses
+python3 pmbus_monitor.py --mux 0x70 --channels 0-3 --addr 0x58   # via un PDB
+python3 pmbus_monitor.py --config psus.example.json              # multi-bus / multi-mux
+python3 pmbus_monitor.py --auth admin:secret --control           # + actions d'écriture
+python3 pmbus_monitor.py --mock                 # simulation, sans matériel
 ```
 
-Page web : `https://<ip-de-la-BBB>:8443` (certificat auto-signé créé dans `~/.pmbus_monitor`,
-l'avertissement du navigateur est normal ; `--cert/--key` pour le tien, `--http` pour du HTTP).
-Onglets : vue d'ensemble, détails et codes d'erreur (tous les registres STATUS_*),
-graphiques (historique 1 h en mémoire), journal des événements.
-Sans `--web` : affichage terminal, `--json`, `--csv`.
+Au démarrage, le terminal affiche les adresses de la page (`https://<ip>:8443`), le pilote I2C et l'état de chaque PSU.
+Si aucun PSU n'est trouvé, la page reste ouverte, le script retente toutes les 30 s et le bouton « Rescanner » force la détection.
+
+Onglets : vue d'ensemble, détails et codes d'erreur (tous les registres STATUS_*), graphiques (+ export CSV),
+registres (≈105 registres PMBus décodés), journal des événements.
+`--control` (exige `--auth`) ajoute les boutons « Effacer les défauts », ON et OFF.
 
 Documentation PMBus : dossier `docs/`.
