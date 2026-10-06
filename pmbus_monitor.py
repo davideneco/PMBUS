@@ -15,6 +15,7 @@ Exemples :
   ./pmbus_monitor.py --mux 0x70 --channels 0-3 --addr 0x58
   ./pmbus_monitor.py --addr 0x58 --once --json      # une mesure, sortie JSON
   ./pmbus_monitor.py --addr 0x58 --csv log.csv -i 5 # log CSV toutes les 5 s
+  ./pmbus_monitor.py --mux 0x70 --channels 0-3 --web   # page web sur http://<ip-bbb>:8080
 
 BBB : I2C2 = /dev/i2c-2 (P9_19 SCL / P9_20 SDA) est le bus par défaut.
       I2C1 = /dev/i2c-1 (P9_17 SCL / P9_18 SDA) nécessite un overlay.
@@ -28,7 +29,9 @@ import json
 import os
 import signal
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # --------------------------------------------------------------------------
 # Accès I2C / SMBus via ioctl (équivalent minimal de smbus2)
@@ -346,6 +349,130 @@ def write_csv(path, results):
 
 
 # --------------------------------------------------------------------------
+# Interface web (serveur HTTP intégré, aucune dépendance)
+# --------------------------------------------------------------------------
+HTML_PAGE = """<!doctype html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PMBus Monitor</title>
+<style>
+:root{--bg:#f4f5f7;--card:#fff;--fg:#1c1f24;--mut:#6b7280;--ok:#16a34a;--bad:#dc2626;--warn:#d97706;--bd:#e5e7eb}
+@media(prefers-color-scheme:dark){:root{--bg:#111418;--card:#1a1e24;--fg:#e8eaed;--mut:#9aa3af;--bd:#2a3039}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.4 system-ui,sans-serif}
+header{display:flex;justify-content:space-between;align-items:center;padding:14px 16px;flex-wrap:wrap;gap:8px}
+h1{font-size:18px;margin:0}#meta{color:var(--mut);font-size:13px}
+#grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;padding:0 16px 16px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px}
+.card.err{border-color:var(--bad)}.card.flag{border-color:var(--warn)}
+.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
+.name{font-weight:600}.badge{font-size:12px;padding:2px 8px;border-radius:99px;color:#fff;background:var(--ok)}
+.badge.bad{background:var(--bad)}.badge.warn{background:var(--warn)}
+.info{color:var(--mut);font-size:12px;min-height:16px;margin-bottom:8px}
+dl{display:grid;grid-template-columns:1fr auto;gap:4px 12px;margin:0}
+dt{color:var(--mut)}dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;font-weight:500}
+.msg{color:var(--bad)}
+</style></head><body>
+<header><h1>PMBus Monitor</h1><span id="meta">chargement...</span></header>
+<div id="grid"></div>
+<script>
+const LABELS={vin:["VIN","V"],iin:["IIN","A"],pin:["PIN","W"],vout:["VOUT","V"],iout:["IOUT","A"],
+pout:["POUT","W"],temp1:["Temp 1","\u00b0C"],temp2:["Temp 2","\u00b0C"],temp3:["Temp 3","\u00b0C"],
+fan1:["Fan 1","rpm"],fan2:["Fan 2","rpm"]};
+const DEC={vin:1,iin:2,pin:0,vout:2,iout:2,pout:0,temp1:0,temp2:0,temp3:0,fan1:0,fan2:0};
+const grid=document.getElementById("grid"),meta=document.getElementById("meta");
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
+function card(name,d){
+  if(d.error)return `<div class="card err"><div class="top"><span class="name">${esc(name)}</span><span class="badge bad">HS</span></div><div class="msg">${esc(d.error)}</div></div>`;
+  const ok=d.status_word===0,cls=ok?"":"flag";
+  const badge=ok?'<span class="badge">OK</span>':`<span class="badge warn" title="${esc(d.flags.join(", "))}">${esc(d.flags.join(", ")||"0x"+d.status_word.toString(16))}</span>`;
+  const info=[d.mfr,d.model].filter(Boolean).join(" ");
+  let rows="";for(const k in LABELS){if(k in d)rows+=`<dt>${LABELS[k][0]}</dt><dd>${d[k].toFixed(DEC[k])} ${LABELS[k][1]}</dd>`}
+  return `<div class="card ${cls}"><div class="top"><span class="name">${esc(name)}</span>${badge}</div><div class="info">${esc(info)}</div><dl>${rows}</dl></div>`;
+}
+async function tick(){
+  try{
+    const r=await fetch("api/data",{cache:"no-store"}),j=await r.json();
+    grid.innerHTML=Object.entries(j.psu).map(([n,d])=>card(n,d)).join("");
+    meta.textContent="bus "+j.bus+" \u2022 maj "+new Date(j.time*1000).toLocaleTimeString()+" \u2022 toutes les "+j.interval+" s";
+  }catch(e){meta.textContent="connexion perdue...";}
+}
+tick();setInterval(tick,2000);
+</script></body></html>
+"""
+
+
+class WebState:
+    """Dernière mesure partagée entre le thread I2C et le serveur HTTP."""
+
+    def __init__(self, bus_num, interval):
+        self.lock = threading.Lock()
+        self.data = {"time": 0, "bus": bus_num, "interval": interval, "psu": {}}
+        self.info = {}
+
+
+def poll_loop(bus, args, targets, state, stop):
+    first = True
+    while not stop.is_set():
+        results = collect(bus, args, targets, with_info=first)
+        if args.csv:
+            write_csv(args.csv, results)
+        with state.lock:
+            for label, d in results:
+                if first and "error" not in d:
+                    state.info[label] = {k: d.get(k, "") for k in ("mfr", "model")}
+                if "error" not in d:
+                    d.update(state.info.get(label, {}))
+            state.data["time"] = time.time()
+            state.data["psu"] = dict(results)
+        first = False
+        stop.wait(args.interval)
+
+
+def make_handler(state):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            path = self.path.split("?")[0]
+            if path in ("/", "/index.html"):
+                body, ctype = HTML_PAGE.encode(), "text/html; charset=utf-8"
+            elif path == "/api/data":
+                with state.lock:
+                    body = json.dumps(state.data).encode()
+                ctype = "application/json"
+            else:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_):
+            pass
+
+    return Handler
+
+
+def run_web(bus, args, targets):
+    state = WebState(args.bus, args.interval)
+    stop = threading.Event()
+    t = threading.Thread(target=poll_loop, args=(bus, args, targets, state, stop), daemon=True)
+    t.start()
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(state))
+    print("Interface web : http://%s:%d  (Ctrl+C pour arrêter)" % (
+        args.host if args.host != "0.0.0.0" else "<ip-de-la-BBB>", args.port), flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+        server.server_close()
+        t.join(timeout=args.interval + 2)
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 def int_auto(s):
@@ -381,6 +508,9 @@ def main():
     p.add_argument("--scan", action="store_true", help="scanner le bus (et les canaux du mux)")
     p.add_argument("--info", action="store_true", help="afficher fabricant/modèle/série")
     p.add_argument("--json", action="store_true", help="sortie JSON (une ligne par mesure)")
+    p.add_argument("--web", action="store_true", help="servir une page web au lieu d'afficher dans le terminal")
+    p.add_argument("--port", type=int, default=8080, help="port HTTP (défaut 8080)")
+    p.add_argument("--host", default="0.0.0.0", help="adresse d'écoute (défaut 0.0.0.0 = toutes)")
     p.add_argument("--csv", metavar="FICHIER", help="ajouter les mesures à un fichier CSV")
     args = p.parse_args()
     args.channels = parse_channels(args.channels)
@@ -399,6 +529,9 @@ def main():
             return
 
         targets = build_targets(args)
+        if args.web:
+            run_web(bus, args, targets)
+            return
         first = True
         while True:
             results = collect(bus, args, targets, with_info=args.info and first)
