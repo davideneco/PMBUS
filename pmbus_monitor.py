@@ -13,7 +13,7 @@ Topologies gérées (combinables via --config) :
 
 Exemples :
   ./pmbus_monitor.py --scan                                   # cherche les périphériques
-  ./pmbus_monitor.py --autodetect                             # détecte les PSU 0x58-0x5F
+  ./pmbus_monitor.py --autodetect                             # détecte les PSU sur tous les bus I2C
   ./pmbus_monitor.py --addr 0x58 0x59                         # 2 PSU en direct (web par défaut)
   ./pmbus_monitor.py --mux 0x70 --channels 0-3 --addr 0x58 --web   # 4 PSU derrière un PDB
   ./pmbus_monitor.py --config psus.json --web --auth admin:secret # topologie complète
@@ -516,35 +516,103 @@ class BusWorker:
 
 
 def scan_bus(bus):
+    """Adresses qui répondent (lecture d'octet, comme i2cdetect ; repli sur STATUS_WORD)."""
     found = []
     for a in range(0x03, 0x78):
-        try:
-            if 0x30 <= a <= 0x37 or 0x50 <= a <= 0x5F:
-                bus.read_byte_data(a, 0x00)   # évite de corrompre des EEPROM
-            else:
-                bus.read_byte(a)
+        if safe(bus.read_byte, a) is not None or safe(bus.read_word_data, a, CMD_STATUS_WORD) is not None:
             found.append(a)
-        except OSError:
-            pass
     return found
 
 
-def do_scan(args):
-    bus = I2CBus(args.bus)
+def hexl(addrs):
+    return " ".join("0x%02X" % a for a in addrs) or "(rien)"
 
-    def show(label, addrs):
-        print("%s: %s" % (label, " ".join("0x%02X" % a for a in addrs) or "(rien)"))
 
-    show("Bus %d" % args.bus, scan_bus(bus))
-    if args.mux is not None:
-        for ch in args.channels:
-            try:
-                bus.write_byte(args.mux, 1 << ch)
-                show("  mux 0x%02X canal %d" % (args.mux, ch), scan_bus(bus))
-            except OSError as e:
-                print("  mux 0x%02X canal %d: erreur %s" % (args.mux, ch, e))
-        safe(bus.write_byte, args.mux, 0)
-    bus.close()
+def looks_like_pmbus(bus, addr):
+    """Un périphérique est pris pour un PSU PMBus s'il lit STATUS_WORD et confirme par d'autres commandes."""
+    if safe(bus.read_word_data, addr, CMD_STATUS_WORD) is None:
+        return False
+    score = 0
+    rev = safe(bus.read_byte_data, addr, CMD_PMBUS_REVISION)
+    if rev is not None and (rev >> 4) <= 4 and (rev & 0xF) <= 4:
+        score += 1
+    for cmd in (CMD_VOUT_MODE, CMD_CAPABILITY):
+        if safe(bus.read_byte_data, addr, cmd) is not None:
+            score += 1
+    for cmd in (0x88, 0x8B, 0x8C, 0x8D):   # READ_VIN / VOUT / IOUT / TEMPERATURE_1
+        if safe(bus.read_word_data, addr, cmd) is not None:
+            score += 1
+    return score >= 2
+
+
+def is_mux(bus, addr):
+    """PCA954x : l'octet de contrôle écrit se relit à l'identique."""
+    try:
+        bus.write_byte(addr, 0x01)
+        ok = bus.read_byte(addr) & 0x0F == 0x01
+        bus.write_byte(addr, 0x00)
+        return ok
+    except OSError:
+        return False
+
+
+def discover(args, report=True):
+    """Balaye tous les bus I2C (ou celui demandé avec -b), les mux du PDB et toutes les adresses.
+    Renvoie la liste des PSU PMBus trouvés."""
+    say = print if report else (lambda *a, **k: None)
+    nums = [args.bus] if args.bus_explicit else sorted(
+        int(f.split("-")[1]) for f in os.listdir("/dev") if f.startswith("i2c-") and f.split("-")[1].isdigit())
+    if not nums:
+        say("Aucun /dev/i2c-* : active le bus I2C (overlay / config-pin) et vérifie les droits.")
+        return []
+    say("Bus I2C à balayer : %s" % ", ".join(map(str, nums)))
+    psus = []
+    for num in nums:
+        try:
+            bus = I2CBus(num)
+        except OSError as e:
+            say("Bus %d : ouverture impossible (%s)" % (num, e))
+            continue
+        try:
+            # 1) mux : on les repère et on les remet à zéro avant tout balayage direct
+            cands = [args.mux] if args.mux is not None else [a for a in range(0x70, 0x78)
+                                                              if safe(bus.read_byte, a) is not None]
+            muxes = [m for m in cands if is_mux(bus, m)]
+            direct = scan_bus(bus)
+            say("Bus %d : %s" % (num, hexl(direct)))
+            if muxes:
+                say("  mux I2C détecté(s) : %s" % hexl(muxes))
+            skip = set(muxes) | set(range(0x50, 0x58))   # mux et EEPROM FRU : pas des PSU
+            for a in direct:
+                if (args.addr is None or a in args.addr) and a not in skip:
+                    if looks_like_pmbus(bus, a):
+                        psus.append(Psu("PSU%d" % (len(psus) + 1), num, a))
+                        say("  -> PSU PMBus en 0x%02X (direct)" % a)
+                    else:
+                        say("  0x%02X répond mais n'est pas reconnu comme PMBus" % a)
+            # 2) derrière chaque mux, canal par canal
+            for m in muxes:
+                chans = args.channels if args.mux is not None else range(8)
+                for ch in chans:
+                    try:
+                        bus.write_byte(m, 1 << ch)
+                    except OSError:
+                        continue
+                    found = [a for a in scan_bus(bus) if a != m]
+                    if found:
+                        say("  mux 0x%02X canal %d : %s" % (m, ch, hexl(found)))
+                    for a in found:
+                        if (args.addr is None or a in args.addr) and a not in skip and a not in muxes:
+                            if looks_like_pmbus(bus, a):
+                                psus.append(Psu("PSU%d" % (len(psus) + 1), num, a, m, ch))
+                                say("  -> PSU PMBus en 0x%02X (mux 0x%02X canal %d)" % (a, m, ch))
+                            else:
+                                say("  0x%02X (canal %d) répond mais n'est pas reconnu comme PMBus" % (a, ch))
+                safe(bus.write_byte, m, 0)
+        finally:
+            bus.close()
+    say("Détection terminée : %d PSU PMBus trouvé(s)." % len(psus))
+    return psus
 
 
 # --------------------------------------------------------------------------
@@ -589,33 +657,6 @@ def psus_from_args(args):
         for a in addrs:
             for pg in pages:
                 psus.append(Psu("PSU%d" % (len(psus) + 1), args.bus, a, args.mux, ch, pg))
-    return psus
-
-
-def autodetect(args):
-    """Cherche les PSU PMBus (réponse à STATUS_WORD) sur le bus et derrière le mux."""
-    addrs = args.addr or list(range(0x58, 0x60))
-    bus = I2CBus(args.bus)
-    psus = []
-
-    def probe(mux, ch):
-        for a in addrs:
-            if safe(bus.read_word_data, a, CMD_STATUS_WORD) is None:
-                continue
-            psus.append(Psu("PSU%d" % (len(psus) + 1), args.bus, a, mux, ch))
-
-    # le mux répond à l'écriture d'un octet ; on le désactive pendant le scan direct
-    if args.mux is None:
-        probe(None, None)
-    else:
-        for ch in args.channels:
-            try:
-                bus.write_byte(args.mux, 1 << ch)
-            except OSError:
-                continue
-            probe(args.mux, ch)
-        safe(bus.write_byte, args.mux, 0)
-    bus.close()
     return psus
 
 
@@ -793,6 +834,7 @@ function renderSummary(){
 
 function eff(v){return v.pin>5&&v.pout!=null?v.pout/v.pin*100:null}
 function renderOverview(){
+  if(!data.psus.length){$("grid").innerHTML='<div class="empty">Aucun PSU détecté. Regarde le terminal SSH (rapport de détection), vérifie le câblage et relance, ou utilise <code>--scan</code>, <code>-b</code>, <code>--addr</code>, <code>--mux</code>.</div>';return}
   $("grid").innerHTML=data.psus.map(p=>{
     if(p.summary==="pending")return `<div class="card pending"><div class="name">${esc(p.name)}</div><div class="loc">lecture en cours…</div></div>`;
     if(!p.online)return `<div class="card offline click" data-p="${esc(p.name)}"><div class="top"><span class="name">${esc(p.name)}</span><span class="pill offline">Hors ligne</span></div><div class="loc">${esc(p.loc)}</div><div class="err">${esc(p.error||"")}</div></div>`;
@@ -1143,8 +1185,8 @@ def print_banner(state, psus, workers, scheme, port, args):
             else:
                 print("   [HORS LIGNE   ] %-12s %s  %s" % (p.name, p.loc, r.get("error", "")))
     if not any(state.latest.get(p.name, {}).get("online") for p in psus):
-        print("\n Aucun PSU ne répond : vérifie le câblage, lance --scan pour voir les adresses,")
-        print(" puis relance avec --addr 0x5X (et --mux 0x7X si tu as un PDB). La page web reste ouverte.")
+        print("\n Aucun PSU ne répond : vérifie le câblage et l'alimentation du PSU, lance --scan")
+        print(" pour voir les adresses, puis relance avec -b <bus> --addr 0x5X (et --mux 0x7X avec un PDB).")
     print(line)
     print(" Ctrl+C pour arrêter\n", flush=True)
 
@@ -1273,15 +1315,15 @@ def run_terminal(workers, args):
 def main():
     p = argparse.ArgumentParser(description="Moniteur PMBus pour BeagleBone Black",
                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
-    p.add_argument("-b", "--bus", type=int, default=2, help="bus I2C par défaut (défaut 2)")
+    p.add_argument("-b", "--bus", type=int, help="bus I2C (défaut : tous les bus détectés ; 2 pour une config manuelle)")
     p.add_argument("-a", "--addr", type=int_auto, nargs="+", help="adresse(s) PMBus des PSU (défaut 0x58)")
     p.add_argument("--mux", type=int_auto, help="adresse du mux I2C du PDB (ex: 0x70)")
     p.add_argument("--channels", nargs="+", default=["0-7"], help="canaux du mux, ex: 0-3 (défaut 0-7)")
     p.add_argument("--pages", type=int, nargs="+", help="pages PMBus pour les PSU multi-rails, ex: 0 1")
     p.add_argument("--config", metavar="FICHIER", help="fichier JSON décrivant tous les PSU (multi-bus, multi-mux)")
-    p.add_argument("--autodetect", action="store_true", help="détecter les PSU (0x58-0x5F ou --addr)")
+    p.add_argument("--autodetect", action="store_true", help="détecter les PSU sur tous les bus (déjà le cas sans --addr/--config)")
     p.add_argument("-i", "--interval", type=float, help="période de lecture en s (défaut 2)")
-    p.add_argument("--scan", action="store_true", help="scanner le bus (et les canaux du mux)")
+    p.add_argument("--scan", action="store_true", help="rapport complet : bus, adresses, mux, PSU PMBus détectés")
     p.add_argument("--once", action="store_true", help="une seule mesure puis quitter")
     p.add_argument("--info", action="store_true", help="terminal : afficher l'identité des PSU")
     p.add_argument("--json", action="store_true", help="sortie JSON (terminal)")
@@ -1302,33 +1344,30 @@ def main():
     w.add_argument("--history", type=int, default=3600, help="durée d'historique gardée en mémoire, en s (défaut 3600)")
     args = p.parse_args()
     args.channels = parse_channels(args.channels)
+    args.bus_explicit = args.bus is not None
+    if args.bus is None:
+        args.bus = 2
     # L'interface web est le mode par défaut ; --once / --json / --terminal donnent le mode terminal.
     args.web = not (args.terminal or args.once or args.json)
 
     if args.scan:
-        try:
-            do_scan(args)
-        except OSError as e:
-            sys.exit("Impossible d'ouvrir /dev/i2c-%d : %s" % (args.bus, e))
+        discover(args)
         return
 
     cfg_interval = None
     try:
         if args.config:
             psus, cfg_interval = psus_from_config(args.config, args.bus)
-        elif args.autodetect or (args.addr is None and args.mux is None and not args.pages):
-            psus = autodetect(args)
-            if not psus and not args.autodetect:   # rien trouvé : on garde un PSU 0x58 "hors ligne" pour ouvrir la page
-                print("Aucun PSU détecté automatiquement, essai sur 0x58.")
-                psus = psus_from_args(args)
+        elif args.autodetect or (args.addr is None and not args.pages):
+            psus = discover(args)
         else:
             psus = psus_from_args(args)
     except (OSError, ValueError, KeyError) as e:
         sys.exit("Configuration impossible : %s" % e)
     args.interval = args.interval or cfg_interval or 2.0
-    if not psus:
-        sys.exit("Aucun PSU trouvé. Essaie --scan pour voir ce qui répond sur le bus.")
-    if not args.web:
+    if not psus and not args.web:
+        sys.exit("Aucun PSU trouvé. Lance --scan pour voir ce qui répond sur les bus.")
+    if psus and not args.web:
         print("%d PSU : %s" % (len(psus), ", ".join("%s (%s)" % (x.name, x.loc) for x in psus)))
     unique_names(psus)
 
