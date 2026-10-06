@@ -1066,8 +1066,13 @@ def local_ips():
         s.close()
     except OSError:
         pass
-    ips.discard("127.0.1.1")
-    return sorted(ips)
+    try:   # BBB : l'IP USB (192.168.7.2) n'a pas toujours de route par défaut
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show"], capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            ips.add(line.split()[3].split("/")[0])
+    except (OSError, IndexError):
+        pass
+    return sorted(i for i in ips if not i.startswith("127."))
 
 
 def ensure_cert(certdir, regen=False):
@@ -1092,6 +1097,56 @@ def ensure_cert(certdir, regen=False):
     os.chmod(key, 0o600)
     print("Certificat auto-signé créé dans %s" % certdir)
     return crt, key
+
+
+def wait_first_poll(state, psus, timeout=15):
+    end = time.time() + timeout
+    while time.time() < end:
+        with state.lock:
+            if all(p.name in state.latest for p in psus):
+                return
+        time.sleep(0.2)
+
+
+def print_banner(state, psus, workers, scheme, port, args):
+    ips = [args.host] if args.host != "0.0.0.0" else local_ips()
+    host = socket.gethostname()
+    line = "=" * 64
+    print("\n" + line)
+    print(" PMBus Monitor - interface web disponible")
+    print(line)
+    print(" Ouvre l'une de ces adresses dans ton navigateur :")
+    for ip in ips:
+        print("   %s://%s:%d" % (scheme, ip, port))
+    if args.host == "0.0.0.0":
+        print("   %s://%s.local:%d   (si ton réseau gère le mDNS)" % (scheme, host, port))
+    if not ips:
+        print("   %s://<ip-de-la-BBB>:%d   (aucune IP détectée)" % (scheme, port))
+    if scheme == "https":
+        print(" Certificat auto-signé : accepte l'avertissement du navigateur")
+        print("   (Avancé > Continuer). Certificat : %s" % args.certdir)
+    if args.auth:
+        print(" Connexion : utilisateur '%s' (mot de passe défini avec --auth)" % args.auth.split(":")[0])
+    else:
+        print(" Accès sans mot de passe (ajoute --auth utilisateur:motdepasse)")
+    print(" Intervalle de lecture : %g s - historique : %d min" % (args.interval, args.history // 60))
+    print("-" * 64)
+    print(" %d PSU, %d bus I2C :" % (len(psus), len(workers)))
+    with state.lock:
+        for p in psus:
+            r = state.latest.get(p.name, {})
+            if r.get("online"):
+                info = r.get("info", {})
+                what = " ".join(x for x in (info.get("Fabricant (MFR_ID)"), info.get("Modèle (MFR_MODEL)")) if x)
+                st = {"ok": "OK", "warn": "AVERTISSEMENT", "fault": "DÉFAUT", "off": "ÉTEINT"}.get(r["summary"], r["summary"])
+                print("   [%-13s] %-12s %s  %s" % (st, p.name, p.loc, what))
+            else:
+                print("   [HORS LIGNE   ] %-12s %s  %s" % (p.name, p.loc, r.get("error", "")))
+    if not any(state.latest.get(p.name, {}).get("online") for p in psus):
+        print("\n Aucun PSU ne répond : vérifie le câblage, lance --scan pour voir les adresses,")
+        print(" puis relance avec --addr 0x5X (et --mux 0x7X si tu as un PDB). La page web reste ouverte.")
+    print(line)
+    print(" Ctrl+C pour arrêter\n", flush=True)
 
 
 def run_web(workers, psus, args):
@@ -1129,10 +1184,8 @@ def run_web(workers, psus, args):
         ctx.load_cert_chain(crt, key)
         server.ctx = ctx
         scheme = "https"
-    shown = args.host if args.host != "0.0.0.0" else (local_ips() or ["<ip-de-la-BBB>"])[0]
-    print("%d PSU sur %d bus. Interface web : %s://%s:%d  (Ctrl+C pour arrêter)%s" % (
-        len(psus), len(workers), scheme, shown, port,
-        "" if args.auth else "\nATTENTION : pas d'authentification (--auth utilisateur:motdepasse)"), flush=True)
+    wait_first_poll(state, psus)
+    print_banner(state, psus, workers, scheme, port, args)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1263,8 +1316,11 @@ def main():
     try:
         if args.config:
             psus, cfg_interval = psus_from_config(args.config, args.bus)
-        elif args.autodetect:
+        elif args.autodetect or (args.addr is None and args.mux is None and not args.pages):
             psus = autodetect(args)
+            if not psus and not args.autodetect:   # rien trouvé : on garde un PSU 0x58 "hors ligne" pour ouvrir la page
+                print("Aucun PSU détecté automatiquement, essai sur 0x58.")
+                psus = psus_from_args(args)
         else:
             psus = psus_from_args(args)
     except (OSError, ValueError, KeyError) as e:
@@ -1272,6 +1328,8 @@ def main():
     args.interval = args.interval or cfg_interval or 2.0
     if not psus:
         sys.exit("Aucun PSU trouvé. Essaie --scan pour voir ce qui répond sur le bus.")
+    if not args.web:
+        print("%d PSU : %s" % (len(psus), ", ".join("%s (%s)" % (x.name, x.loc) for x in psus)))
     unique_names(psus)
 
     workers = []
