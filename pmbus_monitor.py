@@ -22,8 +22,7 @@ Exemples :
   ./pmbus_monitor.py --mock                                   # 3 PSU simulés, pour tester la page sans matériel
   ./pmbus_monitor.py --auth admin:secret --control            # + boutons effacer défauts / ON / OFF
 
-Interface web : https://<ip-bbb>:8443 (certificat auto-signé, l'avertissement du
-navigateur est normal ; --http pour du HTTP clair sur le port 8080).
+Interface web : http://<ip-bbb>:8080 (--https pour HTTPS avec certificat auto-signé, port 8443).
 
 Exemple de psus.json :
   {"interval": 2,
@@ -959,6 +958,7 @@ def discover(args, report=True):
         return []
     say("Bus I2C à balayer : %s" % ", ".join(map(str, nums)))
     psus = []
+    ids = {}    # identité (fabricant, modèle, série) -> emplacement déjà retenu
 
     def check(bus, num, addrs, mux=None, ch=None):
         for a in sorted(addrs):
@@ -966,8 +966,14 @@ def discover(args, report=True):
                 continue
             where = "direct" if mux is None else "mux 0x%02X canal %d" % (mux, ch)
             if looks_like_pmbus(bus, a):
+                ident = tuple(read_text(bus, a, c) for c in (0x99, 0x9A, 0x9E))
+                if ident[2]:                   # N° de série lu : deux emplacements identiques = même PSU
+                    if ident in ids:
+                        say("  0x%02X (%s) ignoré : doublon de %s (série %s)" % (a, where, ids[ident], ident[2]))
+                        continue
+                    ids[ident] = "bus %d 0x%02X %s" % (num, a, where)
                 psus.append(Psu("PSU%d" % (len(psus) + 1), num, a, mux, ch))
-                say("  -> PSU PMBus en 0x%02X (%s)" % (a, where))
+                say("  -> PSU PMBus en 0x%02X (%s) %s" % (a, where, " ".join(x for x in ident if x)))
             elif a in seen:
                 say("  0x%02X (%s) répond mais n'est pas reconnu comme PMBus" % (a, where))
 
@@ -1077,6 +1083,7 @@ class State:
     def reset(self, psus):
         with self.lock:
             self.order = [p.name for p in psus]
+            self.seen = set()      # PSU déjà vus en ligne : les autres restent invisibles
             self.latest = {}
             self.hist = {p.name: {} for p in psus}
             self.maxlen = max(120, int(self.history_s / max(self.interval, 0.2)))
@@ -1109,6 +1116,11 @@ class State:
         with self.lock:
             for r in results:
                 name, t = r["name"], r["t"]
+                if r["online"]:
+                    self.seen.add(name)
+                elif name not in self.seen:      # jamais répondu : on ne l'affiche pas
+                    self.latest[name] = r
+                    continue
                 prev = self.latest.get(name)
                 was_online = prev.get("online") if prev else None
                 if r["online"] is False and was_online is not False:
@@ -1132,8 +1144,7 @@ class State:
 
     def snapshot(self):
         with self.lock:
-            psus = [self.latest.get(n) or {"name": n, "loc": "", "summary": "pending", "online": None}
-                    for n in self.order]
+            psus = [self.latest[n] for n in self.order if n in self.seen]
         return {"time": time.time(), "interval": self.interval, "psus": psus}
 
     def history(self, since):
@@ -1295,7 +1306,7 @@ function renderSummary(){
 
 function eff(v){return v.pin>5&&v.pout!=null?v.pout/v.pin*100:null}
 function renderOverview(){
-  if(!data.psus.length){$("grid").innerHTML='<div class="empty">Aucun PSU détecté. Regarde le terminal SSH (rapport de détection), vérifie le câblage et relance, ou utilise <code>--scan</code>, <code>-b</code>, <code>--addr</code>, <code>--mux</code>.</div>';return}
+  if(!data.psus.length){$("grid").innerHTML='<div class="empty">Aucun PSU détecté. Le script retente toutes les 30 s ; bouton « Rescanner » pour forcer. Détail : <code>--scan</code> ou <code>--verbose</code> ; sinon <code>-b</code>, <code>--addr</code>, <code>--mux</code>.</div>';return}
   $("grid").innerHTML=data.psus.map(p=>{
     if(p.summary==="pending")return `<div class="card pending"><div class="name">${esc(p.name)}</div><div class="loc">lecture en cours…</div></div>`;
     if(!p.online)return `<div class="card offline click" data-p="${esc(p.name)}"><div class="top"><span class="name">${esc(p.name)}</span><span class="pill offline">Hors ligne</span></div><div class="loc">${esc(p.loc)}</div><div class="err">${esc(p.error||"")}</div></div>`;
@@ -1308,7 +1319,7 @@ function renderOverview(){
     const e=eff(v);if(e!=null)rows+=`<dt>Rendement</dt><dd>${e.toFixed(1)} %</dd>`;
     const chips=p.alarms.slice(0,6).map(a=>`<span class="chip ${a.sev}" title="${esc(a.desc)}">${esc(a.name)}</span>`).join("")+
       (p.alarms.length>6?`<span class="chip info">+${p.alarms.length-6}</span>`:"");
-    return `<div class="card ${p.summary} click" data-p="${esc(p.name)}"><div class="top"><span class="name">${esc(p.name)}</span><span class="pill ${p.summary}">${SEV[p.summary]}</span></div><div class="loc">${esc(p.loc)}</div><dl>${rows}</dl><div class="chips">${chips}</div></div>`;
+    return `<div class="card ${p.summary} click" data-p="${esc(p.name)}"><div class="top"><span class="name">${esc(p.name)}</span><span class="pill ${p.summary}">${SEV[p.summary]}</span></div><div class="loc">${esc(p.loc)}</div><div class="loc" style="margin-top:-6px">${esc([p.info&&p.info["Modèle (MFR_MODEL)"],p.info&&p.info["N° de série"]&&("SN "+p.info["N° de série"])].filter(Boolean).join(" · "))}</div><dl>${rows}</dl><div class="chips">${chips}</div></div>`;
   }).join("");
   document.querySelectorAll("#grid .click").forEach(c=>c.onclick=()=>{sel=c.dataset.p;document.querySelector('[data-tab=details]').click()});
 }
@@ -1505,6 +1516,7 @@ class Monitor:
                 try:
                     self.workers.append(BusWorker(b, mine))
                 except OSError as e:
+                    print("bus %d inaccessible : %s" % (b, e), file=sys.stderr)
                     self.state.update([{"name": x.name, "loc": x.loc, "t": time.time(), "online": False,
                                         "summary": "offline", "error": "bus %d inaccessible : %s" % (b, e)}
                                        for x in mine])
@@ -1654,9 +1666,9 @@ def make_handler(mon, auth, control):
                 return self._json({"error": "JSON invalide"}, 400)
             path = urllib.parse.urlparse(self.path).path
             if path == "/api/rescan":
-                psus = mon.rescan()
-                print("Nouveau balayage : %d PSU" % len(psus), flush=True)
-                self._json({"psus": len(psus)})
+                mon.rescan()
+                time.sleep(min(6, mon.args.interval * 2 + 3))    # laisse le temps à la première lecture
+                self._json({"psus": len(mon.state.seen)})
             elif path == "/api/action":
                 if not control:
                     return self._json({"error": "actions désactivées (lancer avec --control)"}, 403)
@@ -1748,6 +1760,13 @@ def wait_first_poll(state, psus, timeout=20):
         time.sleep(0.2)
 
 
+def print_short_banner(scheme, port, args):
+    ips = [args.host] if args.host != "0.0.0.0" else (local_ips() or ["<ip-de-la-BBB>"])
+    print("PMBus monitor - interface web :")
+    for ip in ips:
+        print("  %s://%s:%d" % (scheme, ip, port), flush=True)
+
+
 def print_banner(state, psus, workers, scheme, port, args, backend=""):
     ips = [args.host] if args.host != "0.0.0.0" else local_ips()
     host = socket.gethostname()
@@ -1796,10 +1815,10 @@ def run_web(psus, args, build):
     mon = Monitor(args, build)
     mon.backend = "simulation" if args.mock else ("smbus2" if _SMBus else "ioctl")
     mon.start(psus)
-    port = args.port or (8080 if args.http else 8443)
+    port = args.port or (8443 if args.https else 8080)
     server = Server((args.host, port), make_handler(mon, args.auth, args.control))
     scheme = "http"
-    if not args.http:
+    if args.https:
         if args.cert and args.key:
             crt, key = args.cert, args.key
         else:
@@ -1813,16 +1832,18 @@ def run_web(psus, args, build):
     def auto_rescan():   # tant qu'aucun PSU n'est trouvé, on retente toutes les 30 s (branchement à chaud)
         while True:
             time.sleep(30)
-            if not mon.psus:
+            if not mon.state.seen:
                 try:
-                    if mon.rescan():
-                        print("PSU détecté(s) : %s" % ", ".join(p.name for p in mon.psus), flush=True)
+                    mon.rescan()
                 except Exception as e:
                     print("rescan : %s" % e, file=sys.stderr)
 
     threading.Thread(target=auto_rescan, daemon=True).start()
-    wait_first_poll(mon.state, psus)
-    print_banner(mon.state, psus, mon.workers, scheme, port, args, mon.backend)
+    if args.verbose:
+        wait_first_poll(mon.state, psus)
+        print_banner(mon.state, psus, mon.workers, scheme, port, args, mon.backend)
+    else:
+        print_short_banner(scheme, port, args)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1925,9 +1946,10 @@ def main():
     w = p.add_argument_group("interface web")
     p.add_argument("--terminal", action="store_true", help="affichage terminal au lieu de l'interface web")
     w.add_argument("--web", action="store_true", help="(défaut) servir l'interface web, HTTPS par défaut")
-    w.add_argument("--port", type=int, help="port (défaut 8443 en HTTPS, 8080 en HTTP)")
+    w.add_argument("--port", type=int, help="port (défaut 8080 en HTTP, 8443 en HTTPS)")
     w.add_argument("--host", default="0.0.0.0", help="adresse d'écoute (défaut toutes)")
-    w.add_argument("--http", action="store_true", help="HTTP clair, sans TLS")
+    w.add_argument("--https", action="store_true", help="servir en HTTPS (certificat auto-signé) au lieu de HTTP")
+    w.add_argument("--verbose", action="store_true", help="afficher le détail (détection, état des PSU) dans le terminal")
     w.add_argument("--certdir", default=os.path.expanduser("~/.pmbus_monitor"),
                    help="dossier du certificat auto-signé (défaut ~/.pmbus_monitor)")
     w.add_argument("--cert", help="certificat PEM à utiliser (avec --key)")
@@ -1964,7 +1986,7 @@ def main():
         if args.config:
             return psus_from_config(args.config, args.bus)[0]
         if args.autodetect or (args.addr is None and not args.pages):
-            return discover(args, report)
+            return discover(args, report and args.verbose)
         return psus_from_args(args)
 
     try:
@@ -1983,7 +2005,8 @@ def main():
         return
 
     unique_names(psus)
-    print("%d PSU : %s" % (len(psus), ", ".join("%s (%s)" % (x.name, x.loc) for x in psus)))
+    if args.verbose:
+        print("%d PSU : %s" % (len(psus), ", ".join("%s (%s)" % (x.name, x.loc) for x in psus)))
     workers = []
     try:
         for b in sorted({x.bus for x in psus}):

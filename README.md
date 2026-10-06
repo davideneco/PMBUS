@@ -28,8 +28,13 @@ python3 pmbus_monitor.py --auth admin:secret --control           # + actions d'�
 python3 pmbus_monitor.py --mock                 # simulation, sans matériel
 ```
 
-Au démarrage, le terminal affiche les adresses de la page (`https://<ip>:8443`), le pilote I2C et l'état de chaque PSU.
-Si aucun PSU n'est trouvé, la page reste ouverte, le script retente toutes les 30 s et le bouton « Rescanner » force la détection.
+Le terminal n'affiche que le titre et l'adresse de la page (`http://<ip>:8080`). `--verbose` ajoute le détail
+(détection, pilote I2C, état des PSU) ; `--scan` donne le rapport de détection. `--https` active HTTPS (port 8443,
+certificat auto-signé). Attention : sans HTTPS, le mot de passe `--auth` circule en clair sur le réseau.
+
+Seuls les PSU qui ont répondu au moins une fois sont affichés. Deux emplacements qui renvoient le même numéro de série
+sont considérés comme un seul PSU (doublon ignoré). Si aucun PSU n'est trouvé, la page reste ouverte, le script
+retente toutes les 30 s et le bouton « Rescanner » force la détection.
 
 Onglets : vue d'ensemble, détails et codes d'erreur (tous les registres STATUS_*), graphiques (+ export CSV),
 registres (≈105 registres PMBus décodés), journal des événements.
