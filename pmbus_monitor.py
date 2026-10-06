@@ -623,10 +623,8 @@ def do_control(bus, psu, action):
             bus.write_byte(a, 0x03)                    # CLEAR_FAULTS (send byte)
         except OSError:
             bus.write_byte_data(a, 0x03, 0x00)
-    elif action == "on":
-        bus.write_byte_data(a, CMD_OPERATION, 0x80)
-    elif action == "off":
-        bus.write_byte_data(a, CMD_OPERATION, 0x00)
+    elif action in OPERATION_MODES:
+        bus.write_byte_data(a, CMD_OPERATION, OPERATION_MODES[action])
     else:
         raise ValueError("action inconnue : %s" % action)
 
@@ -662,9 +660,17 @@ def status_defs():
 # --------------------------------------------------------------------------
 # PSU : description, lecture, décodage
 # --------------------------------------------------------------------------
+def psu_id(bus, addr, mux=None, channel=None, page=None):
+    """Identifiant stable, utilisable dans une URL : 2-58, 2-m70c1-58, 2-58-p1."""
+    pid = "%d-" % bus + ("m%02xc%d-" % (mux, channel) if mux is not None else "") + "%02x" % addr
+    return pid + ("-p%d" % page if page is not None else "")
+
+
 class Psu:
     def __init__(self, name, bus, addr, mux=None, channel=None, page=None):
-        self.name, self.bus, self.addr = name, bus, addr
+        self.id = psu_id(bus, addr, mux, channel, page)
+        self.name = name or ("B%d" % bus + ("/C%d" % channel if mux is not None else "") + "/0x%02X" % addr)
+        self.bus, self.addr = bus, addr
         self.mux, self.channel, self.page = mux, channel, page
         loc = "bus %d" % bus
         if mux is not None:
@@ -751,7 +757,7 @@ def _first_contact(bus, psu):
 def read_psu(bus, psu):
     """Une mesure complète. Renvoie toujours un dict avec 'name', 'loc', 'summary'."""
     a = psu.addr
-    res = {"name": psu.name, "loc": psu.loc, "t": time.time()}
+    res = {"id": psu.id, "name": psu.name, "loc": psu.loc, "t": time.time()}
     try:
         if psu.page is not None:
             bus.write_byte_data(a, CMD_PAGE, psu.page)
@@ -879,7 +885,7 @@ class BusWorker:
                 self._select(psu)
             except OSError as e:
                 psu.reset()
-                out.append({"name": psu.name, "loc": psu.loc, "t": time.time(), "online": False,
+                out.append({"id": psu.id, "name": psu.name, "loc": psu.loc, "t": time.time(), "online": False,
                             "summary": "offline", "error": "mux 0x%02X : %s" % (psu.mux, e.strerror or e)})
                 continue
             out.append(read_psu(self.bus, psu))
@@ -944,39 +950,100 @@ def is_mux(bus, addr):
 PSU_RANGE = range(0x58, 0x68)   # adresses habituelles des PSU PMBus (EEPROM FRU en 0x50-0x57)
 
 
+def guess_device(num, addr):
+    """Ce que l'adresse a toutes les chances d'être (périphériques I2C courants)."""
+    if num == 0:   # bus interne de la BeagleBone Black
+        known = {0x24: "PMIC TPS65217 (alimentation de la BeagleBone)", 0x34: "HDMI TDA19988 (CEC)",
+                 0x50: "EEPROM d'identification de la BeagleBone", 0x70: "HDMI TDA19988"}
+        if addr in known:
+            return "systeme", known[addr]
+    if 0x50 <= addr <= 0x57:
+        return "eeprom", "EEPROM (FRU / identification, souvent celle d'un PSU en 0x%02X)" % (addr + 8)
+    ranges = [((0x20, 0x27), "Expandeur d'E/S probable (PCF8574 / MCP23017)"),
+              ((0x38, 0x3B), "Expandeur d'E/S probable (PCF8574A)"),
+              ((0x3C, 0x3D), "Écran OLED probable (SSD1306)"),
+              ((0x40, 0x47), "Capteur courant/tension probable (INA219 / INA226) ou PCA9685"),
+              ((0x48, 0x4F), "Capteur de température ou ADC probable (LM75, TMP10x, ADS1115)"),
+              ((0x68, 0x69), "Horloge RTC (DS1307 / DS3231) ou centrale inertielle probable"),
+              ((0x76, 0x77), "Capteur de pression probable (BMP280 / BME280)")]
+    for (lo, hi), label in ranges:
+        if lo <= addr <= hi:
+            return "autre", label
+    return "autre", "Périphérique I2C non identifié"
+
+
+def scan_one_bus(bus, num, args, ids=None, say=lambda *a: None):
+    """Balaye un bus (adresses directes + canaux de chaque mux).
+    Renvoie (appareils, psus) ; `ids` (identité -> id PSU) sert à repérer les doublons entre bus."""
+    ids = {} if ids is None else ids
+    devices, psus = [], []
+    allow_mux = args.mux is not None or num != 0      # pas d'écriture sur le bus interne de la BBB
+    cands = [args.mux] if args.mux is not None else (
+        [a for a in range(0x70, 0x78) if safe(bus.read_byte, a) is not None] if allow_mux else [])
+    muxes = [m for m in cands if is_mux(bus, m)]       # remis à 0 par is_mux
+    if muxes:
+        say("  mux I2C détecté(s) : %s" % hexl(muxes))
+
+    def segment(found, mux=None, ch=None):
+        where = "direct" if mux is None else "mux 0x%02X canal %d" % (mux, ch)
+        if found:
+            say("  %s : %s" % (where, hexl(found)))
+        # les adresses PSU habituelles sont sondées même si le balayage ne les a pas vues
+        for a in sorted((set(found) | set(PSU_RANGE)) - set(muxes)):
+            dev = {"addr": "0x%02X" % a, "a": a, "mux": None if mux is None else "0x%02X" % mux,
+                   "ch": ch, "where": where, "psu": None}
+            if not (0x50 <= a <= 0x57) and (args.addr is None or a in args.addr) and looks_like_pmbus(bus, a):
+                ident = tuple(read_text(bus, a, c) for c in (0x99, 0x9A, 0x9E))
+                pid = psu_id(num, a, mux, ch)
+                if ident[2] and ids.get(ident, pid) != pid:
+                    dev.update(kind="doublon", label="Doublon du PSU %s (même N° de série %s)" % (ids[ident], ident[2]))
+                    say("  0x%02X (%s) ignoré : doublon de %s" % (a, where, ids[ident]))
+                else:
+                    if ident[2]:
+                        ids[ident] = pid
+                    psu = Psu(None, num, a, mux, ch)
+                    psus.append(psu)
+                    dev.update(kind="psu", psu=psu.id, label="Alimentation PMBus",
+                               detail=" ".join(x for x in ident[:2] if x) + (" · SN " + ident[2] if ident[2] else ""))
+                    say("  -> PSU PMBus en 0x%02X (%s) %s" % (a, where, dev["detail"]))
+            elif a in found:
+                kind, label = guess_device(num, a)
+                dev.update(kind=kind, label=label)
+            else:
+                continue
+            devices.append(dev)
+
+    segment(scan_bus(bus))
+    for m in muxes:
+        devices.append({"addr": "0x%02X" % m, "a": m, "mux": None, "ch": None, "where": "direct",
+                        "psu": None, "kind": "mux", "label": "Mux / switch I2C (PCA954x / TCA954x), 8 canaux"})
+        for ch in (args.channels if args.mux is not None else range(8)):
+            try:
+                bus.write_byte(m, 1 << ch)
+            except OSError:
+                continue
+            segment([a for a in scan_bus(bus) if a != m], m, ch)
+        safe(bus.write_byte, m, 0)
+    devices.sort(key=lambda d: (d["mux"] or "", d["ch"] if d["ch"] is not None else -1, d["a"]))
+    return devices, psus
+
+
+def list_buses():
+    return sorted(int(f.split("-")[1]) for f in os.listdir("/dev")
+                  if f.startswith("i2c-") and f.split("-")[1].isdigit())
+
+
+BUS_HINT = {0: "interne (PMIC, EEPROM, HDMI)", 1: "I2C1 : P9_17 SCL / P9_18 SDA", 2: "I2C2 : P9_19 SCL / P9_20 SDA"}
+
+
 def discover(args, report=True):
-    """Balaye les bus I2C (tous, ou celui demandé avec -b), les mux du PDB et les adresses.
-    Renvoie la liste des PSU PMBus trouvés."""
+    """Balaye les bus I2C (tous sauf 0, ou celui demandé avec -b) et renvoie les PSU trouvés."""
     say = print if report else (lambda *a, **k: None)
-    if args.bus_explicit:
-        nums = [args.bus]
-    else:   # le bus 0 de la BBB est interne (PMIC, EEPROM) : ignoré sauf avec -b 0
-        nums = sorted(n for n in (int(f.split("-")[1]) for f in os.listdir("/dev")
-                                  if f.startswith("i2c-") and f.split("-")[1].isdigit()) if n > 0)
+    nums = [args.bus] if args.bus_explicit else [n for n in list_buses() if n > 0]
     if not nums:
         say("Aucun /dev/i2c-N (N>0) : active le bus I2C (config-pin / overlay) et vérifie les droits.")
         return []
-    say("Bus I2C à balayer : %s" % ", ".join(map(str, nums)))
-    psus = []
-    ids = {}    # identité (fabricant, modèle, série) -> emplacement déjà retenu
-
-    def check(bus, num, addrs, mux=None, ch=None):
-        for a in sorted(addrs):
-            if args.addr is not None and a not in args.addr:
-                continue
-            where = "direct" if mux is None else "mux 0x%02X canal %d" % (mux, ch)
-            if looks_like_pmbus(bus, a):
-                ident = tuple(read_text(bus, a, c) for c in (0x99, 0x9A, 0x9E))
-                if ident[2]:                   # N° de série lu : deux emplacements identiques = même PSU
-                    if ident in ids:
-                        say("  0x%02X (%s) ignoré : doublon de %s (série %s)" % (a, where, ids[ident], ident[2]))
-                        continue
-                    ids[ident] = "bus %d 0x%02X %s" % (num, a, where)
-                psus.append(Psu("PSU%d" % (len(psus) + 1), num, a, mux, ch))
-                say("  -> PSU PMBus en 0x%02X (%s) %s" % (a, where, " ".join(x for x in ident if x)))
-            elif a in seen:
-                say("  0x%02X (%s) répond mais n'est pas reconnu comme PMBus" % (a, where))
-
+    psus, ids = [], {}
     for num in nums:
         try:
             bus = I2CBus(num)
@@ -985,33 +1052,88 @@ def discover(args, report=True):
             continue
         try:
             say("Bus %d (pilote %s) :" % (num, bus.backend))
-            cands = [args.mux] if args.mux is not None else [a for a in range(0x70, 0x78)
-                                                              if safe(bus.read_byte, a) is not None]
-            muxes = [m for m in cands if is_mux(bus, m)]       # remis à 0 par is_mux
-            direct = scan_bus(bus)
-            say("  adresses qui répondent : %s" % hexl(direct))
-            if muxes:
-                say("  mux I2C détecté(s) : %s" % hexl(muxes))
-            skip = set(muxes) | set(range(0x50, 0x58))   # mux et EEPROM FRU : pas des PSU
-            seen = set(direct)
-            # on sonde 0x58-0x67 même si le balayage ne les a pas vues (certains PSU ignorent l'octet seul)
-            check(bus, num, (set(direct) | set(PSU_RANGE)) - skip)
-            for m in muxes:
-                for ch in (args.channels if args.mux is not None else range(8)):
-                    try:
-                        bus.write_byte(m, 1 << ch)
-                    except OSError:
-                        continue
-                    found = [a for a in scan_bus(bus) if a != m]
-                    seen = set(found)
-                    if found:
-                        say("  mux 0x%02X canal %d : %s" % (m, ch, hexl(found)))
-                    check(bus, num, (set(found) | set(PSU_RANGE)) - skip - set(muxes), m, ch)
-                safe(bus.write_byte, m, 0)
+            devices, found = scan_one_bus(bus, num, args, ids, say)
+            for d in devices:
+                if d["kind"] not in ("psu", "doublon"):
+                    say("  0x%02X (%s) : %s" % (d["a"], d["where"], d["label"]))
+            psus += found
         finally:
             bus.close()
     say("Détection terminée : %d PSU PMBus trouvé(s)." % len(psus))
     return psus
+
+
+# Valeurs modifiables (onglet Réglages) : (code, nom, groupe, format, unité)
+WRITABLE = [
+    (0x21, "VOUT_COMMAND", "Sortie", "vout", "V"), (0x24, "VOUT_MAX", "Sortie", "vout", "V"),
+    (0x25, "VOUT_MARGIN_HIGH", "Sortie", "vout", "V"), (0x26, "VOUT_MARGIN_LOW", "Sortie", "vout", "V"),
+    (0x35, "VIN_ON", "Entrée", "l11", "V"), (0x36, "VIN_OFF", "Entrée", "l11", "V"),
+    (0x55, "VIN_OV_FAULT_LIMIT", "Entrée", "l11", "V"), (0x57, "VIN_OV_WARN_LIMIT", "Entrée", "l11", "V"),
+    (0x58, "VIN_UV_WARN_LIMIT", "Entrée", "l11", "V"), (0x59, "VIN_UV_FAULT_LIMIT", "Entrée", "l11", "V"),
+    (0x5B, "IIN_OC_FAULT_LIMIT", "Entrée", "l11", "A"), (0x5D, "IIN_OC_WARN_LIMIT", "Entrée", "l11", "A"),
+    (0x6B, "PIN_OP_WARN_LIMIT", "Entrée", "l11", "W"),
+    (0x40, "VOUT_OV_FAULT_LIMIT", "Protections sortie", "vout", "V"), (0x42, "VOUT_OV_WARN_LIMIT", "Protections sortie", "vout", "V"),
+    (0x43, "VOUT_UV_WARN_LIMIT", "Protections sortie", "vout", "V"), (0x44, "VOUT_UV_FAULT_LIMIT", "Protections sortie", "vout", "V"),
+    (0x46, "IOUT_OC_FAULT_LIMIT", "Protections sortie", "l11", "A"), (0x4A, "IOUT_OC_WARN_LIMIT", "Protections sortie", "l11", "A"),
+    (0x68, "POUT_OP_FAULT_LIMIT", "Protections sortie", "l11", "W"), (0x6A, "POUT_OP_WARN_LIMIT", "Protections sortie", "l11", "W"),
+    (0x4F, "OT_FAULT_LIMIT", "Température", "l11", "°C"), (0x51, "OT_WARN_LIMIT", "Température", "l11", "°C"),
+    (0x52, "UT_WARN_LIMIT", "Température", "l11", "°C"), (0x53, "UT_FAULT_LIMIT", "Température", "l11", "°C"),
+    (0x3B, "FAN_COMMAND_1", "Ventilation & séquencement", "l11", "rpm/%"),
+    (0x3C, "FAN_COMMAND_2", "Ventilation & séquencement", "l11", "rpm/%"),
+    (0x60, "TON_DELAY", "Ventilation & séquencement", "l11", "ms"), (0x61, "TON_RISE", "Ventilation & séquencement", "l11", "ms"),
+    (0x64, "TOFF_DELAY", "Ventilation & séquencement", "l11", "ms"), (0x65, "TOFF_FALL", "Ventilation & séquencement", "l11", "ms"),
+]
+WRITABLE_BY_CODE = {w[0]: w for w in WRITABLE}
+OPERATION_MODES = {"on": 0x80, "off": 0x00, "soft_off": 0x40, "margin_low": 0x94, "margin_high": 0x98}
+
+
+def read_settings(bus, psu):
+    old, bus.retries = bus.retries, 1
+    try:
+        vmode = safe(bus.read_byte_data, psu.addr, CMD_VOUT_MODE)
+        lin16 = vmode is not None and vmode >> 5 == 0
+        out = []
+        for code, name, group, fmt, unit in WRITABLE:
+            raw = safe(bus.read_word_data, psu.addr, code)
+            val = None
+            if raw is not None:
+                val = decode_linear16(raw, vmode) if fmt == "vout" and lin16 else (
+                    None if fmt == "vout" else decode_linear11(raw))
+            out.append({"code": "0x%02X" % code, "name": name, "group": group, "unit": unit, "value": val})
+        op = safe(bus.read_byte_data, psu.addr, CMD_OPERATION)
+        wp = safe(bus.read_byte_data, psu.addr, 0x10)
+        return {"settings": out, "operation": op, "write_protect": wp, "vout_linear": lin16}
+    finally:
+        bus.retries = old
+
+
+def write_setting(bus, psu, code, value):
+    """Écrit une valeur et vérifie que le PSU l'a acceptée (STATUS_CML). Renvoie la valeur relue."""
+    w = WRITABLE_BY_CODE.get(code)
+    if not w:
+        raise ValueError("registre 0x%02X non modifiable ici" % code)
+    a, fmt = psu.addr, w[3]
+    if fmt == "vout":
+        vmode = bus.read_byte_data(a, CMD_VOUT_MODE)
+        if vmode >> 5 != 0:
+            raise ValueError("VOUT_MODE non linéaire : écriture non gérée")
+        exp = vmode & 0x1F
+        exp = exp - 32 if exp > 15 else exp
+        raw = int(round(value / (2.0 ** exp)))
+        if not 0 <= raw <= 0xFFFF:
+            raise ValueError("valeur hors plage")
+    else:
+        raw = encode_linear11(value)
+    cml_before = safe(bus.read_byte_data, a, CMD_STATUS_CML) or 0
+    bus.write_word_data(a, code, raw)
+    cml_after = safe(bus.read_byte_data, a, CMD_STATUS_CML) or 0
+    if (cml_after & ~cml_before) & 0xC0:
+        raise ValueError("refusé par le PSU (STATUS_CML=0x%02X : commande ou donnée invalide, "
+                         "ou écriture protégée par WRITE_PROTECT)" % cml_after)
+    back = safe(bus.read_word_data, a, code)
+    if back is None:
+        return None
+    return decode_linear16(back, vmode) if fmt == "vout" else decode_linear11(back)
 
 
 # --------------------------------------------------------------------------
@@ -1055,7 +1177,7 @@ def psus_from_args(args):
     for ch in chans:
         for a in addrs:
             for pg in pages:
-                psus.append(Psu("PSU%d" % (len(psus) + 1), args.bus, a, args.mux, ch, pg))
+                psus.append(Psu(None, args.bus, a, args.mux, ch, pg))
     return psus
 
 
@@ -1072,503 +1194,315 @@ def unique_names(psus):
 # État partagé : dernières mesures, historique, journal d'événements
 # --------------------------------------------------------------------------
 class State:
-    def __init__(self, psus, interval, history_s):
+    """Dernières mesures, historique et journal de tous les PSU connus (clé : id du PSU)."""
+
+    def __init__(self, interval, history_s):
         self.lock = threading.Lock()
         self.interval = interval
-        self.history_s = history_s
-        self.events = collections.deque(maxlen=1000)
+        self.maxlen = max(120, int(history_s / max(interval, 0.2)))
+        self.events = collections.deque(maxlen=2000)
         self.seq = 0
-        self.reset(psus)
+        self.meta = {}       # id -> Psu
+        self.latest = {}     # id -> dernière mesure
+        self.hist = {}       # id -> {clé: deque[(t, v)]}
+        self.seen = set()    # PSU déjà vus en ligne : les autres restent invisibles
 
-    def reset(self, psus):
+    def add(self, psus):
         with self.lock:
-            self.order = [p.name for p in psus]
-            self.seen = set()      # PSU déjà vus en ligne : les autres restent invisibles
-            self.latest = {}
-            self.hist = {p.name: {} for p in psus}
-            self.maxlen = max(120, int(self.history_s / max(self.interval, 0.2)))
+            for p in psus:
+                if p.id not in self.meta:
+                    self.meta[p.id] = p
+                    self.hist[p.id] = {}
 
-    def export_csv(self):
-        out = io.StringIO()
-        w = csv.writer(out)
-        w.writerow(["time", "psu"] + TELEMETRY_KEYS)
-        with self.lock:
-            for name, series in self.hist.items():
-                rows = {}
-                for k, dq in series.items():
-                    for t, v in dq:
-                        rows.setdefault(round(t, 2), {})[k] = v
-                for t in sorted(rows):
-                    r = rows[t]
-                    w.writerow([time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t)), name]
-                               + [("%.3f" % r[k]) if k in r else "" for k in TELEMETRY_KEYS])
-        return out.getvalue()
-
-    def _event(self, t, psu, sev, msg):
+    def _event(self, t, pid, sev, msg):
         self.seq += 1
-        self.events.append({"id": self.seq, "t": t, "psu": psu, "sev": sev, "msg": msg})
+        p = self.meta.get(pid)
+        self.events.append({"id": self.seq, "t": t, "psu": pid, "name": p.name if p else pid,
+                            "sev": sev, "msg": msg})
 
-    def log(self, psu, sev, msg):
+    def log(self, pid, sev, msg):
         with self.lock:
-            self._event(time.time(), psu, sev, msg)
+            self._event(time.time(), pid, sev, msg)
 
     def update(self, results):
         with self.lock:
             for r in results:
-                name, t = r["name"], r["t"]
+                pid, t = r["id"], r["t"]
                 if r["online"]:
-                    self.seen.add(name)
-                elif name not in self.seen:      # jamais répondu : on ne l'affiche pas
-                    self.latest[name] = r
+                    self.seen.add(pid)
+                elif pid not in self.seen:      # jamais répondu : on ne l'affiche pas
+                    self.latest[pid] = r
                     continue
-                prev = self.latest.get(name)
+                prev = self.latest.get(pid)
                 was_online = prev.get("online") if prev else None
                 if r["online"] is False and was_online is not False:
-                    self._event(t, name, "fault", "Hors ligne : " + r.get("error", ""))
+                    self._event(t, pid, "fault", "Hors ligne : " + r.get("error", ""))
                 elif r["online"] and was_online is False:
-                    self._event(t, name, "info", "De nouveau en ligne")
+                    self._event(t, pid, "info", "De nouveau en ligne")
                 if r["online"]:
                     old = {(a["reg"], a["bit"]) for a in prev.get("alarms", [])} if prev and was_online else set()
+                    new = {(a["reg"], a["bit"]) for a in r["alarms"]}
                     for a in r["alarms"]:
                         if (a["reg"], a["bit"]) not in old:
-                            self._event(t, name, a["sev"], "%s : %s (%s)" % (a["name"], a["desc"], a["reg"]))
-                    new = {(a["reg"], a["bit"]) for a in r["alarms"]}
+                            self._event(t, pid, a["sev"], "%s : %s (%s)" % (a["name"], a["desc"], a["reg"]))
                     if prev and was_online:
                         for a in prev["alarms"]:
                             if (a["reg"], a["bit"]) not in new:
-                                self._event(t, name, "info", "Effacé : %s (%s)" % (a["name"], a["reg"]))
+                                self._event(t, pid, "info", "Effacé : %s (%s)" % (a["name"], a["reg"]))
                     for key, v in r["values"].items():
-                        dq = self.hist[name].setdefault(key, collections.deque(maxlen=self.maxlen))
-                        dq.append((t, v))
-                self.latest[name] = r
+                        self.hist[pid].setdefault(key, collections.deque(maxlen=self.maxlen)).append((t, v))
+                self.latest[pid] = r
 
-    def snapshot(self):
+    def get(self, pid):
         with self.lock:
-            psus = [self.latest[n] for n in self.order if n in self.seen]
-        return {"time": time.time(), "interval": self.interval, "psus": psus}
+            r = self.latest.get(pid)
+            return dict(r) if r and pid in self.seen else None
 
-    def history(self, since):
-        with self.lock:
-            return {n: {k: [[round(t, 2), v] for t, v in dq if t > since] for k, dq in series.items()}
-                    for n, series in self.hist.items()}
+    def brief(self, pid):
+        """Résumé d'un PSU pour les listes (accueil, page bus)."""
+        r = self.latest.get(pid) or {}
+        info = r.get("info") or {}
+        p = self.meta.get(pid)
+        return {"id": pid, "name": p.name if p else pid, "loc": p.loc if p else "", "bus": p.bus if p else None,
+                "summary": r.get("summary", "pending") if pid in self.seen else "pending",
+                "model": info.get("Modèle (MFR_MODEL)", ""), "serial": info.get("N° de série", ""),
+                "pout": (r.get("values") or {}).get("pout"), "alarms": len(r.get("alarms") or [])}
 
-    def events_since(self, since):
+    def visible(self, bus=None):
         with self.lock:
-            return [e for e in self.events if e["id"] > since]
+            return [self.brief(pid) for pid, p in self.meta.items()
+                    if pid in self.seen and (bus is None or p.bus == bus)]
+
+    def history(self, pid, since):
+        with self.lock:
+            series = self.hist.get(pid, {})
+            return {k: [[round(t, 2), v] for t, v in dq if t > since] for k, dq in series.items()}
+
+    def events_since(self, since, pid=None):
+        with self.lock:
+            return [e for e in self.events if e["id"] > since and (pid is None or e["psu"] == pid)]
+
+    def export_csv(self, pid=None):
+        out = io.StringIO()
+        w = csv.writer(out)
+        w.writerow(["time", "psu", "emplacement"] + TELEMETRY_KEYS)
+        with self.lock:
+            for i, series in self.hist.items():
+                if pid and i != pid:
+                    continue
+                rows = {}
+                for k, dq in series.items():
+                    for t, v in dq:
+                        rows.setdefault(round(t, 2), {})[k] = v
+                p = self.meta[i]
+                for t in sorted(rows):
+                    r = rows[t]
+                    w.writerow([time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t)), p.name, p.loc]
+                               + [("%.3f" % r[k]) if k in r else "" for k in TELEMETRY_KEYS])
+        return out.getvalue()
 
 
 METRICS_META = {k: {"label": lab, "unit": u, "dec": d} for k, _c, u, d, lab in TELEMETRY}
 
-# --------------------------------------------------------------------------
-# Page web (tout en un : HTML + CSS + JS, aucune ressource externe)
-# --------------------------------------------------------------------------
-HTML_PAGE = r"""<!doctype html>
-<html lang="fr"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PMBus Monitor</title>
-<style>
-:root{--bg:#f4f5f7;--card:#fff;--fg:#1c1f24;--mut:#6b7280;--bd:#e5e7eb;--ok:#16a34a;--warn:#d97706;--fault:#dc2626;--off:#6b7280;--acc:#2563eb}
-@media(prefers-color-scheme:dark){:root{--bg:#111418;--card:#1a1e24;--fg:#e8eaed;--mut:#9aa3af;--bd:#2a3039;--acc:#60a5fa}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,sans-serif}
-header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 16px}
-h1{font-size:18px;margin:0}#meta{color:var(--mut);font-size:13px;margin-left:auto}
-.pill{font-size:12px;padding:3px 10px;border-radius:99px;color:#fff;background:var(--ok);white-space:nowrap}
-.pill.warn{background:var(--warn)}.pill.fault{background:var(--fault)}.pill.off,.pill.offline,.pill.pending{background:var(--off)}
-nav{display:flex;gap:4px;padding:0 16px;border-bottom:1px solid var(--bd);overflow-x:auto}
-nav button{background:none;border:0;border-bottom:3px solid transparent;color:var(--mut);padding:10px 14px;font:inherit;cursor:pointer;white-space:nowrap}
-nav button.on{color:var(--fg);border-color:var(--acc);font-weight:600}
-main{padding:16px}section[hidden]{display:none}
-#grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:12px}
-.card{background:var(--card);border:1px solid var(--bd);border-left:4px solid var(--ok);border-radius:10px;padding:14px}
-.card.warn{border-left-color:var(--warn)}.card.fault{border-left-color:var(--fault)}
-.card.off,.card.offline,.card.pending{border-left-color:var(--off)}
-.card.click{cursor:pointer}.card.click:hover{border-color:var(--acc)}
-.top{display:flex;justify-content:space-between;align-items:center;gap:8px}
-.name{font-weight:600}.loc{color:var(--mut);font-size:12px;margin-bottom:8px}
-dl{display:grid;grid-template-columns:1fr auto;gap:3px 12px;margin:8px 0 0}
-dt{color:var(--mut)}dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;font-weight:500}
-.chips{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px}
-.chip{font-size:11px;padding:2px 7px;border-radius:6px;background:var(--warn);color:#fff}
-.chip.fault{background:var(--fault)}.chip.info{background:var(--off)}
-.err{color:var(--fault);font-size:13px}
-h2{font-size:16px;margin:20px 0 8px}h3{font-size:13px;margin:14px 0 6px;color:var(--mut);text-transform:uppercase;letter-spacing:.04em}
-.panel{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px;margin-bottom:14px}
-table{border-collapse:collapse;width:100%;font-size:14px}
-td,th{padding:5px 8px;border-bottom:1px solid var(--bd);text-align:left;vertical-align:top}
-th{color:var(--mut);font-weight:500;font-size:12px}td.n{text-align:right;font-variant-numeric:tabular-nums}
-.reg{margin:10px 0}.reg b{font-size:13px}.reg code{color:var(--mut);margin-left:6px}
-.bits{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
-.bit{font-size:11px;padding:2px 7px;border-radius:6px;border:1px solid var(--bd);color:var(--mut)}
-.bit.set{color:#fff;border-color:transparent;background:var(--warn)}.bit.set.fault{background:var(--fault)}.bit.set.info{background:var(--off)}
-.ok-line{color:var(--ok)}
-.bar{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
-select,label{font:inherit;color:var(--fg)}select{background:var(--card);border:1px solid var(--bd);border-radius:6px;padding:5px 8px}
-.leg{display:inline-flex;align-items:center;gap:5px;cursor:pointer;font-size:13px}
-.leg i{width:12px;height:12px;border-radius:3px;display:inline-block}
-#charts{display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:12px}
-@media(max-width:480px){#charts{grid-template-columns:1fr}}
-.ch{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:10px}
-.ch h3{margin:0 0 4px}.ch canvas{width:100%;height:190px;display:block}
-.empty{color:var(--mut);padding:20px;text-align:center}
-.btn{background:var(--acc);color:#fff;border:0;border-radius:6px;padding:6px 12px;font:inherit;font-size:13px;cursor:pointer}
-.btn.gray{background:var(--card);color:var(--fg);border:1px solid var(--bd)}.btn.red{background:var(--fault)}.btn.green{background:var(--ok)}
-.btn:disabled{opacity:.5;cursor:wait}.acts{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
-a.btn{text-decoration:none;display:inline-block}input[type=search]{font:inherit;color:var(--fg);background:var(--card);border:1px solid var(--bd);border-radius:6px;padding:5px 8px}
-.sim{background:var(--warn);color:#fff;font-size:12px;padding:2px 8px;border-radius:6px}
-</style></head><body>
-<header><h1>PMBus Monitor</h1><span id="summary"></span><span id="sim"></span><button class="btn gray" id="rescan" title="Relancer la détection des bus, mux et PSU">↻ Rescanner</button><span id="meta">chargement…</span></header>
-<nav id="tabs">
- <button data-tab="overview" class="on">Vue d'ensemble</button>
- <button data-tab="details">Détails &amp; codes d'erreur</button>
- <button data-tab="graphs">Graphiques</button>
- <button data-tab="registers">Registres</button>
- <button data-tab="events">Journal</button>
-</nav>
-<main>
- <section id="tab-overview"><div id="grid"></div></section>
- <section id="tab-details" hidden>
-  <div class="bar"><label>PSU : <select id="sel"></select></label></div><div id="detail"></div></section>
- <section id="tab-graphs" hidden>
-  <div class="bar"><label>Période : <select id="range">
-    <option value="300">5 min</option><option value="900">15 min</option>
-    <option value="1800">30 min</option><option value="3600" selected>1 h</option></select></label>
-   <span id="legend"></span><a class="btn gray" href="api/export.csv">⬇ Exporter CSV</a></div>
-  <div id="charts"></div></section>
- <section id="tab-registers" hidden>
-  <div class="bar"><label>PSU : <select id="rsel"></select></label>
-   <button class="btn" id="rread">Lire les registres</button>
-   <input type="search" id="rfilter" placeholder="filtrer (nom, code, catégorie)…"><span id="rstat" style="color:var(--mut);font-size:13px"></span></div>
-  <div id="regs" class="panel"><div class="empty">Choisis un PSU puis « Lire les registres » (lecture complète, quelques secondes).</div></div></section>
- <section id="tab-events" hidden><div class="panel"><table id="events"></table></div></section>
-</main>
-<script>
-const SEV={ok:"OK",warn:"Avertissement",fault:"Défaut",off:"Éteint",offline:"Hors ligne",pending:"…",info:"Info"};
-const COLORS=["#2563eb","#dc2626","#16a34a","#d97706","#7c3aed","#0891b2","#db2777","#65a30d","#475569","#ea580c"];
-const $=id=>document.getElementById(id);
-let data=null,hist={},histSince=0,histLoaded=false,events=[],evId=0,tab="overview",sel="all",hidden=new Set(),openSec=new Set(),chartKey="";
-const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-const fmt=(v,d)=>v==null?"–":v.toFixed(d);
-const hex=(v,n)=>"0x"+v.toString(16).toUpperCase().padStart(n,"0");
-const names=()=>data?data.psus.map(p=>p.name):[];
-const color=n=>COLORS[names().indexOf(n)%COLORS.length];
 
-async function post(url,body){
-  const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json","X-Requested-With":"pmbus-monitor"},body:JSON.stringify(body||{})});
-  const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||("HTTP "+r.status));return j;
-}
-$("rescan").onclick=async e=>{
-  const b=e.target;b.disabled=true;b.textContent="Détection…";
-  try{const j=await post("api/rescan");hist={};histSince=0;histLoaded=false;chartKey="";events=[];evId=0;
-    $("meta").textContent=j.psus+" PSU détecté(s)"}catch(x){alert("Rescan impossible : "+x.message)}
-  b.disabled=false;b.textContent="↻ Rescanner";
-};
-let regRows=[];
-function renderRegs(){
-  const f=$("rfilter").value.toLowerCase(),rows=regRows.filter(r=>!f||(r.name+r.code+r.cat+r.desc).toLowerCase().includes(f));
-  if(!regRows.length)return;
-  const cats={};rows.forEach(r=>(cats[r.cat]=cats[r.cat]||[]).push(r));
-  $("regs").innerHTML=Object.entries(cats).map(([c,rs])=>`<h3>${esc(c)}</h3><table><tr><th>Code</th><th>Registre</th><th>Valeur</th><th>Description</th></tr>`+
-    rs.map(r=>`<tr><td><code>${r.code}</code></td><td><b>${esc(r.name)}</b></td><td class="n" style="text-align:left">${esc(r.val)}</td><td style="color:var(--mut)">${esc(r.desc)}</td></tr>`).join("")+`</table>`).join("")||'<div class="empty">Aucun résultat</div>';
-}
-$("rfilter").oninput=renderRegs;
-$("rread").onclick=async e=>{
-  const b=e.target;b.disabled=true;$("rstat").textContent="lecture en cours…";
-  try{const r=await fetch("api/registers?psu="+encodeURIComponent($("rsel").value),{cache:"no-store"}),j=await r.json();
-    if(!r.ok)throw new Error(j.error);regRows=j.registers;renderRegs();
-    $("rstat").textContent=regRows.filter(x=>x.val!=="n/a").length+" / "+regRows.length+" registres supportés — "+new Date().toLocaleTimeString()}
-  catch(x){$("rstat").textContent="erreur : "+x.message}
-  b.disabled=false;
-};
-async function act(psu,action){
-  const txt={clear_faults:"Effacer les défauts mémorisés",on:"Mettre en MARCHE (OPERATION=0x80)",off:"ÉTEINDRE la sortie (OPERATION=0x00)"}[action];
-  if(!confirm(txt+" sur "+psu+" ?"))return;
-  try{await post("api/action",{psu,action});tick(true)}catch(x){alert("Échec : "+x.message)}
-}
-document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>{
-  tab=b.dataset.tab;
-  document.querySelectorAll("#tabs button").forEach(x=>x.classList.toggle("on",x===b));
-  document.querySelectorAll("main>section").forEach(s=>s.hidden=s.id!=="tab-"+tab);
-  if(tab==="graphs")loadHist().then(drawCharts);
-  render();
-});
-$("sel").onchange=e=>{sel=e.target.value;renderDetails()};
-$("range").onchange=()=>drawCharts();
+class BusManager:
+    """Un bus I2C : balayage à la demande, lecture périodique de ses PSU, accès exclusif (verrou)."""
 
-function worst(list){for(const s of ["fault","warn","off","offline"])if(list.some(p=>p.summary===s))return s;return "ok"}
-
-function renderSummary(){
-  const p=data.psus,bad=p.filter(x=>x.summary==="fault").length,w=p.filter(x=>x.summary==="warn").length,
-  off=p.filter(x=>x.summary==="offline").length;
-  const parts=[`${p.length} PSU`];if(bad)parts.push(`${bad} en défaut`);if(w)parts.push(`${w} avert.`);if(off)parts.push(`${off} hors ligne`);
-  $("summary").innerHTML=`<span class="pill ${worst(p)}">${parts.join(" · ")}</span>`;
-  $("meta").textContent="maj "+new Date(data.time*1000).toLocaleTimeString()+" · toutes les "+data.interval+" s";
-}
-
-function eff(v){return v.pin>5&&v.pout!=null?v.pout/v.pin*100:null}
-function renderOverview(){
-  if(!data.psus.length){$("grid").innerHTML='<div class="empty">Aucun PSU détecté. Le script retente toutes les 30 s ; bouton « Rescanner » pour forcer. Détail : <code>--scan</code> ou <code>--verbose</code> ; sinon <code>-b</code>, <code>--addr</code>, <code>--mux</code>.</div>';return}
-  $("grid").innerHTML=data.psus.map(p=>{
-    if(p.summary==="pending")return `<div class="card pending"><div class="name">${esc(p.name)}</div><div class="loc">lecture en cours…</div></div>`;
-    if(!p.online)return `<div class="card offline click" data-p="${esc(p.name)}"><div class="top"><span class="name">${esc(p.name)}</span><span class="pill offline">Hors ligne</span></div><div class="loc">${esc(p.loc)}</div><div class="err">${esc(p.error||"")}</div></div>`;
-    const v=p.values,M=data.metrics;let rows="";
-    for(const k of ["vin","iin","pin","vout","iout","pout"])if(k in v)rows+=`<dt>${k.toUpperCase()}</dt><dd>${fmt(v[k],M[k].dec)} ${M[k].unit}</dd>`;
-    const temps=["temp1","temp2","temp3"].filter(k=>k in v).map(k=>v[k]);
-    if(temps.length)rows+=`<dt>Température max</dt><dd>${Math.max(...temps).toFixed(1)} °C</dd>`;
-    const fans=["fan1","fan2","fan3","fan4"].filter(k=>k in v);
-    if(fans.length)rows+=`<dt>Ventilateurs</dt><dd>${fans.map(k=>v[k].toFixed(0)).join(" / ")} rpm</dd>`;
-    const e=eff(v);if(e!=null)rows+=`<dt>Rendement</dt><dd>${e.toFixed(1)} %</dd>`;
-    const chips=p.alarms.slice(0,6).map(a=>`<span class="chip ${a.sev}" title="${esc(a.desc)}">${esc(a.name)}</span>`).join("")+
-      (p.alarms.length>6?`<span class="chip info">+${p.alarms.length-6}</span>`:"");
-    return `<div class="card ${p.summary} click" data-p="${esc(p.name)}"><div class="top"><span class="name">${esc(p.name)}</span><span class="pill ${p.summary}">${SEV[p.summary]}</span></div><div class="loc">${esc(p.loc)}</div><div class="loc" style="margin-top:-6px">${esc([p.info&&p.info["Modèle (MFR_MODEL)"],p.info&&p.info["N° de série"]&&("SN "+p.info["N° de série"])].filter(Boolean).join(" · "))}</div><dl>${rows}</dl><div class="chips">${chips}</div></div>`;
-  }).join("");
-  document.querySelectorAll("#grid .click").forEach(c=>c.onclick=()=>{sel=c.dataset.p;document.querySelector('[data-tab=details]').click()});
-}
-
-function bitsHtml(reg,val){
-  const d=data.defs.find(x=>x.reg===reg);if(!d)return "";
-  return d.bits.map(([b,n,s,desc])=>`<span class="bit ${val&(1<<b)?"set "+s:""}" title="${esc(desc)}">${b} · ${esc(n)}</span>`).join("");
-}
-function detail(p){
-  let h=`<div class="panel"><div class="top"><h2 style="margin:0">${esc(p.name)}</h2><span class="pill ${p.summary}">${SEV[p.summary]}</span></div><div class="loc">${esc(p.loc)}</div>`;
-  if(!p.online)return h+`<div class="err">${esc(p.error||"")}</div></div>`;
-  const M=data.metrics;
-  if(data.control)h+=`<div class="acts"><button class="btn gray" data-a="clear_faults" data-p="${esc(p.name)}">Effacer les défauts</button><button class="btn green" data-a="on" data-p="${esc(p.name)}">ON</button><button class="btn red" data-a="off" data-p="${esc(p.name)}">OFF</button></div>`;
-  h+=`<h3>Alarmes actives</h3>`;
-  if(!p.alarms.length&&!p.word_flags.filter(f=>f.name!=="OFF").length)h+=`<div class="ok-line">Aucune alarme</div>`;
-  else if(!p.alarms.length)h+=`<div class="ok-line">Aucun détail dans les registres STATUS_* — voir STATUS_WORD ci-dessous</div>`;
-  else h+=`<table><tr><th>Gravité</th><th>Code</th><th>Registre / bit</th><th>Description</th></tr>`+
-    p.alarms.map(a=>`<tr><td><span class="chip ${a.sev}">${SEV[a.sev==="warn"?"warn":a.sev]}</span></td><td><b>${esc(a.name)}</b></td><td>${a.reg} bit ${a.bit}</td><td>${esc(a.desc)}</td></tr>`).join("")+`</table>`;
-  h+=`<h3>Mesures</h3><table>`+Object.keys(p.values).map(k=>`<tr><td>${M[k].label}</td><td class="n">${fmt(p.values[k],M[k].dec)} ${M[k].unit}</td></tr>`).join("");
-  const e=eff(p.values);if(e!=null)h+=`<tr><td>Rendement (POUT/PIN)</td><td class="n">${e.toFixed(1)} %</td></tr>`;
-  if(p.operation!=null)h+=`<tr><td>OPERATION</td><td class="n">${hex(p.operation,2)} (${p.operation&0x80?"ON":"OFF"})</td></tr>`;
-  h+=`</table><h3>Registres de statut</h3>`;
-  h+=`<div class="reg"><b>STATUS_WORD</b><code>${hex(p.status_word,4)}</code><div class="bits">${bitsHtml("STATUS_WORD",p.status_word)}</div></div>`;
-  for(const [r,v] of Object.entries(p.regs))
-    h+=`<div class="reg"><b>${r}</b><code>${hex(v,2)}</code><div class="bits">${bitsHtml(r,v)}</div></div>`;
-  const inf=Object.entries(p.info||{});
-  if(inf.length)h+=`<h3>Identité</h3><table>`+inf.map(([k,v])=>`<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`).join("")+`</table>`;
-  if(p.limits&&p.limits.length){
-    const groups={};p.limits.forEach(l=>(groups[l.group]=groups[l.group]||[]).push(l));
-    h+=`<h3>Limites programmées</h3>`+Object.entries(groups).map(([g,ls])=>{
-      const key=p.name+"|"+g;
-      return `<details data-k="${esc(key)}" ${openSec.has(key)?"open":""}><summary>${esc(g)}</summary><table>`+
-        ls.map(l=>`<tr><td>${l.label}</td><td><code>${hex(l.code,2)}</code></td><td class="n">${l.value.toFixed(3)} ${l.unit}</td></tr>`).join("")+`</table></details>`}).join("");
-  }
-  return h+"</div>";
-}
-function renderDetails(){
-  const opts=`<option value="all">Tous les PSU</option>`+data.psus.map(p=>`<option ${p.name===sel?"selected":""} value="${esc(p.name)}">${esc(p.name)}</option>`).join("");
-  if($("sel").innerHTML!==opts)$("sel").innerHTML=opts;
-  $("sel").value=sel;
-  $("detail").innerHTML=data.psus.filter(p=>sel==="all"||p.name===sel).filter(p=>p.summary!=="pending").map(detail).join("");
-  document.querySelectorAll("#detail [data-a]").forEach(b=>b.onclick=()=>act(b.dataset.p,b.dataset.a));
-  document.querySelectorAll("#detail details").forEach(d=>d.ontoggle=()=>d.open?openSec.add(d.dataset.k):openSec.delete(d.dataset.k));
-}
-function renderRegSel(){
-  const opts=data.psus.map(p=>`<option value="${esc(p.name)}">${esc(p.name)}</option>`).join("");
-  if($("rsel").dataset.o!==opts){const v=$("rsel").value;$("rsel").innerHTML=opts;$("rsel").dataset.o=opts;if(v)$("rsel").value=v}
-}
-function renderEvents(){
-  $("events").innerHTML=`<tr><th>Heure</th><th>PSU</th><th>Gravité</th><th>Événement</th></tr>`+
-   (events.length?events.slice().reverse().map(e=>`<tr><td>${new Date(e.t*1000).toLocaleString()}</td><td>${esc(e.psu)}</td><td><span class="chip ${e.sev}">${SEV[e.sev]}</span></td><td>${esc(e.msg)}</td></tr>`).join(""):`<tr><td colspan="4" class="empty">Aucun événement depuis le démarrage</td></tr>`);
-}
-
-/* ---------- Graphiques ---------- */
-async function loadHist(){
-  const r=await fetch("api/history?since="+histSince,{cache:"no-store"}),j=await r.json();
-  for(const [n,series] of Object.entries(j)){
-    hist[n]=hist[n]||{};
-    for(const [k,pts] of Object.entries(series)){
-      const a=hist[n][k]=hist[n][k]||[];
-      for(const p of pts){a.push(p);if(p[0]>histSince)histSince=p[0]}
-      if(a.length>4000)a.splice(0,a.length-4000);
-    }
-  }
-  histLoaded=true;
-}
-function seriesFor(key){
-  const out=[];
-  for(const n of names()){
-    if(hidden.has(n)||!hist[n])continue;
-    let pts;
-    if(key==="eff"){const a=hist[n].pin,b=hist[n].pout;if(!a||!b)continue;
-      const m=new Map(b);pts=a.filter(p=>p[1]>5&&m.has(p[0])).map(p=>[p[0],m.get(p[0])/p[1]*100]);}
-    else pts=hist[n][key];
-    if(pts&&pts.length)out.push({name:n,color:color(n),pts});
-  }
-  return out;
-}
-function metricKeys(){
-  const keys=Object.keys(data.metrics).filter(k=>names().some(n=>hist[n]&&hist[n][k]&&hist[n][k].length));
-  if(keys.includes("pin")&&keys.includes("pout"))keys.push("eff");
-  return keys;
-}
-function drawCharts(){
-  if(!data||!histLoaded)return;
-  $("legend").innerHTML=names().map(n=>`<label class="leg"><input type="checkbox" data-n="${esc(n)}" ${hidden.has(n)?"":"checked"}><i style="background:${color(n)}"></i>${esc(n)}</label>`).join(" ");
-  document.querySelectorAll("#legend input").forEach(i=>i.onchange=()=>{i.checked?hidden.delete(i.dataset.n):hidden.add(i.dataset.n);drawCharts()});
-  const keys=metricKeys(),key=keys.join(",");
-  if(key!==chartKey){
-    chartKey=key;
-    $("charts").innerHTML=keys.length?keys.map(k=>{
-      const m=k==="eff"?{label:"Rendement (POUT/PIN)",unit:"%"}:data.metrics[k];
-      return `<div class="ch"><h3>${m.label} <span style="text-transform:none">(${m.unit})</span></h3><canvas data-k="${k}"></canvas></div>`}).join(""):`<div class="empty">Pas encore de données…</div>`;
-    document.querySelectorAll("#charts canvas").forEach(cv=>{
-      cv.onmousemove=e=>{cv._hx=e.offsetX;paint(cv)};cv.onmouseleave=()=>{cv._hx=null;paint(cv)};});
-  }
-  document.querySelectorAll("#charts canvas").forEach(paint);
-}
-function paint(cv){
-  const k=cv.dataset.k,dec=k==="eff"?1:data.metrics[k].dec,unit=k==="eff"?"%":data.metrics[k].unit;
-  const ser=seriesFor(k),t1=data.time;let t0=t1-parseInt($("range").value);
-  const first=Math.min(...ser.map(s=>s.pts[0][0]));   // pas de vide à gauche tant que l'historique est court
-  if(first>t0)t0=Math.min(first,t1-30);
-  drawChart(cv,ser,unit,Math.min(dec+1,3),t0,t1,data.interval*3);
-}
-function drawChart(cv,series,unit,dec,t0,t1,gap){
-  const dpr=window.devicePixelRatio||1,w=cv.clientWidth,h=cv.clientHeight;
-  if(cv.width!==Math.round(w*dpr)){cv.width=Math.round(w*dpr);cv.height=Math.round(h*dpr)}
-  const c=cv.getContext("2d");c.setTransform(dpr,0,0,dpr,0,0);c.clearRect(0,0,w,h);
-  const cs=getComputedStyle(document.documentElement),mut=cs.getPropertyValue("--mut"),bd=cs.getPropertyValue("--bd"),fg=cs.getPropertyValue("--fg"),card=cs.getPropertyValue("--card");
-  let lo=Infinity,hi=-Infinity;
-  for(const s of series)for(const p of s.pts){if(p[0]<t0)continue;if(p[1]<lo)lo=p[1];if(p[1]>hi)hi=p[1]}
-  c.font="11px system-ui";c.fillStyle=mut;
-  if(lo===Infinity){c.textAlign="center";c.fillText("pas de données sur cette période",w/2,h/2);return}
-  if(hi-lo<1e-9){lo-=1;hi+=1}else{const pad=(hi-lo)*.1;lo-=pad;hi+=pad}
-  const L=50,R=8,T=8,B=20,pw=w-L-R,ph=h-T-B,X=t=>L+(t-t0)/(t1-t0)*pw,Y=v=>T+(1-(v-lo)/(hi-lo))*ph;
-  c.strokeStyle=bd;c.lineWidth=1;
-  for(let i=0;i<=4;i++){const v=lo+(hi-lo)*i/4,y=Y(v);c.beginPath();c.moveTo(L,y);c.lineTo(w-R,y);c.stroke();c.textAlign="right";c.fillStyle=mut;c.fillText(v.toFixed(dec),L-5,y+4)}
-  for(let i=0;i<=4;i++){const t=t0+(t1-t0)*i/4;c.textAlign=i===0?"left":i===4?"right":"center";c.fillStyle=mut;
-    c.fillText(new Date(t*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit"}),X(t),h-5)}
-  c.lineWidth=1.8;c.lineJoin="round";
-  for(const s of series){c.strokeStyle=s.color;c.beginPath();let prev=null;
-    for(const p of s.pts){if(p[0]<t0)continue;const x=X(p[0]),y=Y(p[1]);
-      if(prev===null||p[0]-prev>gap)c.moveTo(x,y);else c.lineTo(x,y);prev=p[0]}c.stroke()}
-  if(cv._hx!=null&&cv._hx>=L&&cv._hx<=w-R){
-    const t=t0+(cv._hx-L)/pw*(t1-t0);c.strokeStyle=mut;c.beginPath();c.moveTo(cv._hx,T);c.lineTo(cv._hx,T+ph);c.stroke();
-    const lines=[];let tt=t;
-    for(const s of series){let best=null;for(const p of s.pts)if(best===null||Math.abs(p[0]-t)<Math.abs(best[0]-t))best=p;
-      if(best&&Math.abs(best[0]-t)<gap*2){lines.push([s.color,s.name+" : "+best[1].toFixed(dec)+" "+unit]);tt=best[0]}}
-    if(lines.length){
-      const head=new Date(tt*1000).toLocaleTimeString(),bw=Math.max(c.measureText(head).width,...lines.map(l=>c.measureText(l[1]).width))+26,bh=16*(lines.length+1)+6;
-      let bx=cv._hx+10;if(bx+bw>w-R)bx=cv._hx-bw-10;
-      c.fillStyle=card;c.strokeStyle=bd;c.fillRect(bx,T+4,bw,bh);c.strokeRect(bx,T+4,bw,bh);
-      c.textAlign="left";c.fillStyle=mut;c.fillText(head,bx+8,T+18);
-      lines.forEach((l,i)=>{c.fillStyle=l[0];c.fillRect(bx+8,T+25+i*16,8,8);c.fillStyle=fg;c.fillText(l[1],bx+22,T+33+i*16)});
-    }
-  }
-}
-
-/* ---------- Boucle principale ---------- */
-function render(){
-  if(!data)return;
-  renderSummary();
-  if(tab==="overview")renderOverview();
-  if(tab==="details")renderDetails();
-  if(tab==="events")renderEvents();
-  if(tab==="registers")renderRegSel();
-  $("sim").innerHTML=data.mock?'<span class="sim">SIMULATION</span>':"";
-}
-async function tick(once){
-  try{
-    const r=await fetch("api/data",{cache:"no-store"});
-    if(r.status===401){location.reload();return}
-    data=await r.json();
-    if(!window._defs)window._defs=await fetch("api/defs").then(x=>x.json());
-    data.defs=window._defs;
-    const er=await fetch("api/events?since="+evId,{cache:"no-store"}),ej=await er.json();
-    for(const e of ej){events.push(e);evId=Math.max(evId,e.id)}
-    if(events.length>1000)events.splice(0,events.length-1000);
-    render();
-    if(histLoaded){await loadHist();if(tab==="graphs")drawCharts()}
-  }catch(e){$("meta").textContent="connexion perdue…"}
-  if(!once)setTimeout(tick,Math.max(1000,(data?data.interval:2)*1000));
-}
-tick();
-</script></body></html>
-"""
-
-
-# --------------------------------------------------------------------------
-# Serveur HTTP(S)
-# --------------------------------------------------------------------------
-class Monitor:
-    """Pilote les threads de lecture (un par bus) ; peut tout relancer après un nouveau balayage."""
-
-    def __init__(self, args, build):
-        self.args = args
-        self.build = build            # build(report) -> liste de PSU
-        self.state = State([], args.interval, args.history)
+    def __init__(self, num, mon):
+        self.num, self.mon = num, mon
         self.lock = threading.RLock()
-        self.csv_lock = threading.Lock()
-        self.psus, self.workers, self.threads = [], [], []
-        self.stop = threading.Event()
+        self.bus = None
+        self.cur = None          # (mux, canal) sélectionné
+        self.psus, self.devices = [], []
+        self.scanned_at, self.scanning, self.error = None, False, None
+        self.thread = None
 
-    def start(self, psus):
+    def _open(self):
+        if self.bus is None:
+            self.bus = I2CBus(self.num)
+
+    def _select(self, psu):
+        want = (psu.mux, psu.channel) if psu.mux is not None else None
+        if want == self.cur:
+            return
+        try:
+            if self.cur and (want is None or want[0] != self.cur[0]):
+                self.bus.write_byte(self.cur[0], 0)
+            if want:
+                self.bus.write_byte(want[0], 1 << want[1])
+        except OSError:
+            self.cur = None
+            raise
+        self.cur = want
+
+    def deselect(self):
+        if self.cur and self.bus:
+            safe(self.bus.write_byte, self.cur[0], 0)
+        self.cur = None
+
+    def add_psus(self, psus):
         with self.lock:
-            unique_names(psus)
-            self.psus = psus
-            self.state.reset(psus)
-            self.stop = threading.Event()
-            self.workers, self.threads = [], []
-            for b in sorted({x.bus for x in psus}):
-                mine = [x for x in psus if x.bus == b]
-                try:
-                    self.workers.append(BusWorker(b, mine))
-                except OSError as e:
-                    print("bus %d inaccessible : %s" % (b, e), file=sys.stderr)
-                    self.state.update([{"name": x.name, "loc": x.loc, "t": time.time(), "online": False,
-                                        "summary": "offline", "error": "bus %d inaccessible : %s" % (b, e)}
-                                       for x in mine])
-            self.threads = [threading.Thread(target=self._loop, args=(w, self.stop), daemon=True)
-                            for w in self.workers]
-            for t in self.threads:
-                t.start()
+            known = {p.id for p in self.psus}
+            new = [p for p in psus if p.id not in known]
+            self.psus += new
+        self.mon.state.add(new)
+        if self.psus and (self.thread is None or not self.thread.is_alive()):
+            self.thread = threading.Thread(target=self._loop, daemon=True)
+            self.thread.start()
 
-    def halt(self):
-        with self.lock:
-            self.stop.set()
-            for t in self.threads:
-                t.join(timeout=self.args.interval + 5)
-            for w in self.workers:
-                w.close()
-            self.workers, self.threads = [], []
+    def scan(self):
+        if self.scanning:
+            return
+        self.scanning = True
+        try:
+            with self.lock:
+                self._open()
+                self.deselect()
+                devices, psus = scan_one_bus(self.bus, self.num, self.mon.args, self.mon.ids)
+                self.devices, self.error, self.scanned_at = devices, None, time.time()
+            self.add_psus(psus)
+        except OSError as e:
+            self.error = "bus inaccessible : %s" % (e.strerror or e)
+            self.scanned_at = time.time()
+        finally:
+            self.scanning = False
 
-    def rescan(self):
-        with self.lock:
-            self.halt()
-            self.start(self.build(False))
-            return self.psus
+    def scan_async(self):
+        if not self.scanning:
+            threading.Thread(target=self.scan, daemon=True).start()
 
-    def _loop(self, w, stop):
+    def _loop(self):
+        stop, args = self.mon.stop, self.mon.args
         while not stop.is_set():
             t0 = time.time()
             try:
-                results = w.poll()
-                self.state.update(results)
-                if self.args.csv:
-                    with self.csv_lock:
-                        write_csv(self.args.csv, results)
-            except Exception as e:   # un incident sur un bus ne doit pas tuer le thread
-                print("bus %d : %s" % (w.num, e), file=sys.stderr)
-            stop.wait(max(0.05, self.args.interval - (time.time() - t0)))
+                results = []
+                with self.lock:
+                    self._open()
+                    for psu in list(self.psus):
+                        try:
+                            self._select(psu)
+                        except OSError as e:
+                            psu.reset()
+                            results.append({"id": psu.id, "name": psu.name, "loc": psu.loc, "t": time.time(),
+                                            "online": False, "summary": "offline",
+                                            "error": "mux 0x%02X : %s" % (psu.mux, e.strerror or e)})
+                            continue
+                        results.append(read_psu(self.bus, psu))
+                    self.deselect()
+                self.mon.state.update(results)
+                if args.csv:
+                    with self.mon.csv_lock:
+                        write_csv(args.csv, results)
+            except Exception as e:   # un incident sur le bus ne doit pas tuer le thread
+                print("bus %d : %s" % (self.num, e), file=sys.stderr)
+            stop.wait(max(0.05, args.interval - (time.time() - t0)))
 
-    def _find(self, name):
-        for w in self.workers:
-            for p in w.psus:
-                if p.name == name:
-                    return w, p
-        raise KeyError(name)
+    def run(self, psu, fn):
+        """fn(bus) sur ce PSU (mux sélectionné, page positionnée), sans gêner les mesures."""
+        with self.lock:
+            self._open()
+            try:
+                self._select(psu)
+                if psu.page is not None:
+                    self.bus.write_byte_data(psu.addr, CMD_PAGE, psu.page)
+                return fn(self.bus)
+            finally:
+                self.deselect()
 
-    def read_registers(self, name):
-        w, p = self._find(name)
-        return w.run(p, lambda bus: read_registers(bus, p))
+    def info(self, full=False):
+        st = self.mon.state
+        out = {"num": self.num, "hint": BUS_HINT.get(self.num, ""), "scanned_at": self.scanned_at,
+               "scanning": self.scanning, "error": self.error, "devices": len(self.devices),
+               "psu_list": st.visible(self.num)}
+        out["psus"] = len(out["psu_list"])
+        if full:
+            devs = []
+            with st.lock:
+                for d in self.devices:
+                    d = {k: v for k, v in d.items() if k != "a"}
+                    if d.get("psu"):
+                        d.update(st.brief(d["psu"]))
+                    devs.append(d)
+                # PSU connus de ce bus mais absents du balayage (configuration manuelle)
+                listed = {d.get("psu") for d in self.devices}
+                for p in self.psus:
+                    if p.id not in listed and p.id in st.seen:
+                        b = st.brief(p.id)
+                        b.update(addr="0x%02X" % p.addr, where="direct" if p.mux is None else
+                                 "mux 0x%02X canal %d" % (p.mux, p.channel), kind="psu", psu=p.id,
+                                 label="Alimentation PMBus (configurée)", detail="")
+                        devs.append(b)
+            out["device_list"] = devs
+        return out
 
-    def control(self, name, action):
-        w, p = self._find(name)
-        w.run(p, lambda bus: do_control(bus, p, action))
-        self.state.log(p.name, "warn", "Action manuelle : %s" % action)
-        p.reset()   # on relit tout au prochain cycle (limites, statuts)
+    def close(self):
+        with self.lock:
+            if self.bus:
+                self.deselect()
+                self.bus.close()
+                self.bus = None
+
+
+class Monitor:
+    def __init__(self, args):
+        self.args = args
+        self.state = State(args.interval, args.history)
+        self.stop = threading.Event()
+        self.ids = {}            # identité (fabricant, modèle, série) -> id : repère les doublons
+        self.buses = {}
+        self.lock = threading.Lock()
+        self.csv_lock = threading.Lock()
+        self.backend = "simulation" if args.mock else ("smbus2" if _SMBus else "ioctl")
+
+    def available(self):
+        if self.args.mock:
+            return [self.args.bus]
+        nums = list_buses()
+        if self.args.bus_explicit and self.args.bus not in nums:
+            nums.append(self.args.bus)
+        return sorted(nums)
+
+    def bus(self, num):
+        with self.lock:
+            if num not in self.buses:
+                self.buses[num] = BusManager(num, self)
+            return self.buses[num]
+
+    def find(self, pid):
+        for bm in list(self.buses.values()):
+            for p in bm.psus:
+                if p.id == pid:
+                    return bm, p
+        raise KeyError(pid)
+
+    def read_registers(self, pid):
+        bm, p = self.find(pid)
+        return bm.run(p, lambda bus: read_registers(bus, p))
+
+    def settings(self, pid):
+        bm, p = self.find(pid)
+        return bm.run(p, lambda bus: read_settings(bus, p))
+
+    def write(self, pid, code, value):
+        bm, p = self.find(pid)
+        back = bm.run(p, lambda bus: write_setting(bus, p, code, value))
+        self.state.log(pid, "warn", "Écriture %s = %g" % (WRITABLE_BY_CODE[code][1], value))
+        p.reset()   # limites relues au prochain cycle
+        return back
+
+    def control(self, pid, action):
+        bm, p = self.find(pid)
+        bm.run(p, lambda bus: do_control(bus, p, action))
+        self.state.log(pid, "warn", "Action manuelle : %s" % action)
+        p.reset()
+
+    def halt(self):
+        self.stop.set()
+        for bm in list(self.buses.values()):
+            if bm.thread:
+                bm.thread.join(timeout=self.args.interval + 5)
+            bm.close()
 
 
 def make_handler(mon, auth, control):
@@ -1611,41 +1545,71 @@ def make_handler(mon, auth, control):
             self.send_header("Content-Length", "0")
             self.end_headers()
 
+        def _common(self):
+            return {"time": time.time(), "interval": mon.args.interval, "control": control,
+                    "mock": bool(mon.args.mock), "backend": mon.backend}
+
+        def _hw(self, fn):
+            """Appel matériel à la demande, erreurs traduites en JSON."""
+            try:
+                return self._json(fn())
+            except KeyError:
+                return self._json({"error": "PSU inconnu"}, 404)
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+            except OSError as e:
+                return self._json({"error": "accès I2C impossible : %s" % (e.strerror or e)}, 502)
+            except Exception as e:   # jamais de requête qui meurt sans réponse
+                return self._json({"error": "erreur interne : %s" % e}, 500)
+
         def do_GET(self):
             if not self._authorized():
                 return self._deny()
             u = urllib.parse.urlparse(self.path)
             q = urllib.parse.parse_qs(u.query)
+            arg = lambda k, d="": q.get(k, [d])[0]
 
-            def num(name, default=0.0):
+            def num(k, default=0.0):
                 try:
-                    return float(q.get(name, [default])[0])
+                    return float(arg(k, default))
                 except ValueError:
                     return default
 
             if u.path in ("/", "/index.html"):
                 self._send(page, "text/html; charset=utf-8")
-            elif u.path == "/api/data":
-                snap = state.snapshot()
-                snap.update(metrics=METRICS_META, control=control, backend=mon.backend,
-                            mock=bool(mon.args.mock))
-                self._json(snap)
+            elif u.path == "/api/buses":
+                d = self._common()
+                d.update(buses=[mon.bus(n).info() for n in mon.available()], psus=state.visible())
+                self._json(d)
+            elif u.path == "/api/bus":
+                n = int(num("num", -1))
+                if n not in mon.available():
+                    return self._json({"error": "bus %d introuvable" % n}, 404)
+                d = self._common()
+                d.update(mon.bus(n).info(full=True))
+                self._json(d)
+            elif u.path == "/api/psu":
+                pid = arg("id")
+                if pid not in state.meta:
+                    return self._json({"error": "PSU inconnu"}, 404)
+                d = self._common()
+                p = state.meta[pid]
+                d.update(id=pid, bus=p.bus, name=p.name, loc=p.loc, metrics=METRICS_META,
+                         data=state.get(pid))
+                self._json(d)
             elif u.path == "/api/defs":
                 self._send(defs_json, "application/json")
             elif u.path == "/api/history":
-                self._json(state.history(num("since")))
+                self._json(state.history(arg("id"), num("since")))
             elif u.path == "/api/events":
-                self._json(state.events_since(int(num("since"))))
+                self._json(state.events_since(int(num("since")), arg("id") or None))
             elif u.path == "/api/registers":
-                try:
-                    self._json({"registers": mon.read_registers(q.get("psu", [""])[0])})
-                except KeyError:
-                    self._json({"error": "PSU inconnu"}, 404)
-                except OSError as e:
-                    self._json({"error": "lecture impossible : %s" % (e.strerror or e)}, 502)
+                self._hw(lambda: {"registers": mon.read_registers(arg("id"))})
+            elif u.path == "/api/settings":
+                self._hw(lambda: mon.settings(arg("id")))
             elif u.path == "/api/export.csv":
                 name = "pmbus_%s.csv" % time.strftime("%Y%m%d_%H%M%S")
-                self._send(state.export_csv().encode(), "text/csv; charset=utf-8",
+                self._send(state.export_csv(arg("id") or None).encode(), "text/csv; charset=utf-8",
                            extra={"Content-Disposition": 'attachment; filename="%s"' % name})
             elif u.path == "/favicon.ico":
                 self.send_response(204)
@@ -1665,29 +1629,411 @@ def make_handler(mon, auth, control):
             except (ValueError, TypeError):
                 return self._json({"error": "JSON invalide"}, 400)
             path = urllib.parse.urlparse(self.path).path
-            if path == "/api/rescan":
-                mon.rescan()
-                time.sleep(min(6, mon.args.interval * 2 + 3))    # laisse le temps à la première lecture
-                self._json({"psus": len(mon.state.seen)})
-            elif path == "/api/action":
-                if not control:
-                    return self._json({"error": "actions désactivées (lancer avec --control)"}, 403)
+            if path == "/api/scan":
                 try:
-                    mon.control(str(body.get("psu", "")), str(body.get("action", "")))
-                    self._json({"status": "ok"})
-                except KeyError:
-                    self._json({"error": "PSU inconnu"}, 404)
-                except ValueError as e:
-                    self._json({"error": str(e)}, 400)
-                except OSError as e:
-                    self._json({"error": "écriture impossible : %s" % (e.strerror or e)}, 502)
-            else:
-                self.send_error(404)
+                    bnum = int(body.get("bus"))
+                except (TypeError, ValueError):
+                    return self._json({"error": "bus invalide"}, 400)
+                if bnum not in mon.available():
+                    return self._json({"error": "bus %d introuvable" % bnum}, 404)
+                mon.bus(bnum).scan_async()
+                return self._json({"scanning": True})
+            if path not in ("/api/action", "/api/write"):
+                return self.send_error(404)
+            if not control:
+                return self._json({"error": "modifications désactivées : relancer avec --auth user:mdp --control"}, 403)
+            pid = str(body.get("id", ""))
+            if path == "/api/action":
+                return self._hw(lambda: (mon.control(pid, str(body.get("action", ""))), {"status": "ok"})[1])
+            try:
+                code = int_auto(body.get("code"))
+                value = float(body.get("value"))
+            except (TypeError, ValueError):
+                return self._json({"error": "code ou valeur invalide"}, 400)
+            self._hw(lambda: {"status": "ok", "value": mon.write(pid, code, value)})
 
         def log_message(self, *_):
             pass
 
     return Handler
+
+
+# --------------------------------------------------------------------------
+# Page web (tout en un : HTML + CSS + JS, aucune ressource externe)
+# --------------------------------------------------------------------------
+HTML_PAGE = r"""<!doctype html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PMBus Monitor</title>
+<style>
+:root{--bg:#f4f5f7;--card:#fff;--fg:#1c1f24;--mut:#6b7280;--bd:#e5e7eb;--ok:#16a34a;--warn:#d97706;--fault:#dc2626;--off:#6b7280;--acc:#2563eb;--hov:#eef2ff}
+@media(prefers-color-scheme:dark){:root{--bg:#111418;--card:#1a1e24;--fg:#e8eaed;--mut:#9aa3af;--bd:#2a3039;--acc:#60a5fa;--hov:#1e2836}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,sans-serif}
+a{color:var(--acc)}
+header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 16px;background:var(--card);border-bottom:1px solid var(--bd)}
+.brand{font-weight:700;font-size:17px;color:var(--fg);text-decoration:none}
+#crumbs{color:var(--mut);font-size:14px}#crumbs a{color:var(--mut);text-decoration:none}#crumbs a:hover{color:var(--acc)}
+.grow{flex:1}#meta{color:var(--mut);font-size:12px}
+main{padding:16px;max-width:1400px;margin:0 auto}
+h1{font-size:20px;margin:0}h2{font-size:16px;margin:24px 0 10px}
+h3{font-size:12px;margin:16px 0 6px;color:var(--mut);text-transform:uppercase;letter-spacing:.05em}
+.mut{color:var(--mut);font-size:13px}
+.pill{font-size:12px;padding:3px 10px;border-radius:99px;color:#fff;background:var(--ok);white-space:nowrap;display:inline-block}
+.pill.warn{background:var(--warn)}.pill.fault{background:var(--fault)}.pill.off,.pill.offline,.pill.pending{background:var(--off)}
+.sim{background:var(--warn);color:#fff;font-size:12px;padding:2px 8px;border-radius:6px}
+.bar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+.btn{background:var(--acc);color:#fff;border:0;border-radius:6px;padding:7px 13px;font:inherit;font-size:14px;cursor:pointer;text-decoration:none;display:inline-block;white-space:nowrap}
+.btn.gray{background:var(--card);color:var(--fg);border:1px solid var(--bd)}.btn.red{background:var(--fault)}.btn.green{background:var(--ok)}.btn.amber{background:var(--warn)}
+.btn:disabled{opacity:.5;cursor:not-allowed}.btn.sm{padding:4px 10px;font-size:13px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
+.card{background:var(--card);border:1px solid var(--bd);border-left:4px solid var(--acc);border-radius:10px;padding:14px;color:var(--fg);text-decoration:none;display:block}
+.card.ok{border-left-color:var(--ok)}.card.warn{border-left-color:var(--warn)}.card.fault{border-left-color:var(--fault)}.card.off,.card.offline,.card.pending{border-left-color:var(--off)}
+a.card:hover{border-color:var(--acc);background:var(--hov)}
+.top{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.name{font-weight:600;font-size:16px}.loc{color:var(--mut);font-size:12px;margin-top:2px}
+.stats{margin-top:10px;font-size:14px}.go{margin-top:10px;color:var(--acc);font-size:13px;text-align:right}
+.chips{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px}
+.chip{font-size:11px;padding:2px 7px;border-radius:6px;background:var(--warn);color:#fff}
+.chip.fault{background:var(--fault)}.chip.info{background:var(--off)}
+.panel{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px;margin-bottom:14px;overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:14px}
+td,th{padding:7px 8px;border-bottom:1px solid var(--bd);text-align:left;vertical-align:middle}
+th{color:var(--mut);font-weight:500;font-size:12px}td.n{text-align:right;font-variant-numeric:tabular-nums}
+tr.seg td{background:var(--bg);font-weight:600;font-size:13px;color:var(--mut)}
+tr.click{cursor:pointer}tr.click:hover td{background:var(--hov)}
+code{font-family:ui-monospace,monospace;font-size:13px}
+.kind{font-size:11px;padding:2px 8px;border-radius:6px;border:1px solid var(--bd);white-space:nowrap}
+.kind.psu{background:var(--acc);color:#fff;border-color:transparent}.kind.mux{background:#7c3aed;color:#fff;border-color:transparent}
+.kind.doublon{background:var(--off);color:#fff;border-color:transparent}
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--bd);margin-bottom:14px;overflow-x:auto}
+.tabs a{padding:10px 16px;color:var(--mut);text-decoration:none;border-bottom:3px solid transparent;white-space:nowrap}
+.tabs a.on{color:var(--fg);border-color:var(--acc);font-weight:600}
+.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px;margin-bottom:14px}
+.tile{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px}
+.tile .l{color:var(--mut);font-size:12px}.tile .v{font-size:26px;font-weight:600;font-variant-numeric:tabular-nums;margin-top:2px}
+.tile .u{font-size:14px;color:var(--mut);font-weight:400;margin-left:3px}
+.reg{margin:10px 0}.reg b{font-size:13px}.reg code{color:var(--mut);margin-left:6px}
+.bits{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
+.bit{font-size:11px;padding:2px 7px;border-radius:6px;border:1px solid var(--bd);color:var(--mut)}
+.bit.set{color:#fff;border-color:transparent;background:var(--warn)}.bit.set.fault{background:var(--fault)}.bit.set.info{background:var(--off)}
+.ok-line{color:var(--ok)}.err{color:var(--fault)}
+.note{background:var(--hov);border-radius:8px;padding:10px 12px;font-size:14px;margin-bottom:12px}
+select,input{font:inherit;color:var(--fg);background:var(--card);border:1px solid var(--bd);border-radius:6px;padding:5px 8px}
+input[type=number]{width:120px}
+#charts{display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:12px}
+@media(max-width:520px){#charts{grid-template-columns:1fr}.tile .v{font-size:22px}}
+.ch{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:10px}
+.ch h3{margin:0 0 4px}.ch canvas{width:100%;height:190px;display:block}
+.empty{color:var(--mut);padding:24px;text-align:center}
+.res{font-size:13px}.res.ok{color:var(--ok)}.res.bad{color:var(--fault)}
+</style></head><body>
+<header><a class="brand" href="#/">PMBus Monitor</a><nav id="crumbs"></nav><span class="grow"></span><span id="sim"></span><span id="meta"></span></header>
+<main id="view"></main>
+<script>
+const SEV={ok:"OK",warn:"Avertissement",fault:"Défaut",off:"Éteint",offline:"Hors ligne",pending:"…",info:"Info"};
+const KIND={psu:"Alimentation",mux:"Mux I2C",eeprom:"EEPROM",systeme:"Système BBB",autre:"Autre",doublon:"Doublon"};
+const TABS=[["mesures","Mesures"],["graphiques","Graphiques"],["erreurs","Erreurs"],["reglages","Réglages"],["registres","Registres"]];
+const $=id=>document.getElementById(id);
+const esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const fmt=(v,d)=>v==null?"–":v.toFixed(d);
+const hex=(v,n)=>"0x"+v.toString(16).toUpperCase().padStart(n,"0");
+const hm=t=>new Date(t*1000).toLocaleTimeString();
+let tok=0,timer=null,defs=null,cur=null,lastCommon={interval:2};
+
+async function api(url){const r=await fetch(url,{cache:"no-store"});if(r.status===401){location.reload();throw new Error("auth")}
+  const j=await r.json();if(!r.ok)throw new Error(j.error||("HTTP "+r.status));return j}
+async function post(url,body){
+  const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json","X-Requested-With":"pmbus-monitor"},body:JSON.stringify(body||{})});
+  const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||("HTTP "+r.status));return j}
+function crumbs(list){$("crumbs").innerHTML=list.map(([t,h])=>h?`<a href="${h}">${esc(t)}</a>`:`<span>${esc(t)}</span>`).join(" › ")}
+function common(j){lastCommon=j;$("sim").innerHTML=j.mock?'<span class="sim">SIMULATION</span>':"";$("meta").textContent="maj "+hm(j.time)}
+/* boucle de rafraîchissement liée à la page affichée */
+function loop(fn,ms){
+  const my=++tok;clearTimeout(timer);
+  const tick=async()=>{if(my!==tok)return;try{await fn()}catch(e){if(e.message!=="auth")$("meta").textContent="erreur : "+e.message}
+    if(my===tok)timer=setTimeout(tick,typeof ms==="function"?ms():ms)};
+  tick();
+}
+window.onhashchange=route;
+function route(){
+  const r=location.hash.replace(/^#\/?/,"").split("/").filter(Boolean);
+  window.scrollTo(0,0);
+  if(r[0]==="bus")busPage(+r[1]);else if(r[0]==="psu")psuPage(decodeURIComponent(r[1]),r[2]||"mesures");else home();
+}
+
+/* ================= Accueil : choix du bus ================= */
+function psuCard(p){
+  return `<a class="card ${p.summary}" href="#/psu/${encodeURIComponent(p.id)}"><div class="top"><span class="name">${esc(p.model||p.name)}</span><span class="pill ${p.summary}">${SEV[p.summary]}</span></div>
+  <div class="loc">${esc(p.loc)}${p.serial?" · SN "+esc(p.serial):""}</div>
+  <div class="stats">${p.pout!=null?"POUT "+p.pout.toFixed(0)+" W":""}${p.alarms?` · <span class="err">${p.alarms} alarme(s)</span>`:""}</div><div class="go">Ouvrir ›</div></a>`;
+}
+function home(){
+  cur=null;crumbs([["Accueil"]]);
+  $("view").innerHTML=`<div class="bar"><h1>Choisis un bus I2C</h1></div><div id="buses" class="grid"></div>
+   <h2>PSU détectés</h2><div id="quick" class="grid"></div>`;
+  loop(async()=>{
+    const j=await api("api/buses");common(j);
+    $("buses").innerHTML=j.buses.map(b=>{
+      const st=b.scanning?'<span class="pill pending">balayage…</span>':b.error?'<span class="pill fault">erreur</span>':"";
+      const txt=b.scanning?"balayage en cours…":b.error?esc(b.error):b.scanned_at?`${b.devices} appareil(s) · ${b.psus} PSU`:"pas encore balayé — ouvre-le pour lancer la détection";
+      return `<a class="card" href="#/bus/${b.num}"><div class="top"><span class="name">Bus I2C ${b.num}</span>${st}</div>
+       <div class="loc">/dev/i2c-${b.num}${b.hint?" · "+esc(b.hint):""}</div><div class="stats">${txt}</div>
+       <div class="chips">${b.psu_list.map(p=>`<span class="pill ${p.summary}">${esc(p.model||p.name)}</span>`).join("")}</div><div class="go">Ouvrir ›</div></a>`;
+    }).join("")||'<div class="empty">Aucun bus I2C trouvé (/dev/i2c-*). Active le bus (config-pin / overlay).</div>';
+    $("quick").innerHTML=j.psus.length?j.psus.map(psuCard).join(""):'<div class="empty">Aucun PSU détecté pour l\'instant. Ouvre un bus pour voir ce qui y est branché.</div>';
+  },3000);
+}
+
+/* ================= Page d'un bus : liste des adresses ================= */
+function busPage(n){
+  cur=null;crumbs([["Accueil","#/"],["Bus "+n]]);
+  $("view").innerHTML=`<div class="bar"><a class="btn gray" href="#/">← Accueil</a><h1>Bus I2C ${n}</h1><span id="hint" class="mut"></span>
+    <span class="grow"></span><span id="scaninfo" class="mut"></span><button class="btn" id="rescan">↻ Rescanner</button></div>
+    <div class="panel"><table id="devs"><tr><td class="empty">Chargement…</td></tr></table></div>
+    <p class="mut">Seules les alimentations PMBus sont réellement interrogées ; les autres descriptions (« probable ») sont déduites de l'adresse.
+    Clique sur une alimentation pour ouvrir sa page.</p>`;
+  let asked=false;
+  $("rescan").onclick=async()=>{try{await post("api/scan",{bus:n});$("scaninfo").textContent="balayage en cours…";$("rescan").disabled=true}catch(e){alert(e.message)}};
+  loop(async()=>{
+    const b=await api("api/bus?num="+n);common(b);
+    $("hint").textContent=b.hint?"/dev/i2c-"+n+" · "+b.hint:"/dev/i2c-"+n;
+    if(!b.scanned_at&&!b.scanning&&!asked){asked=true;await post("api/scan",{bus:n});b.scanning=true}
+    $("scaninfo").textContent=b.scanning?"balayage en cours…":b.error?b.error:b.scanned_at?"balayé à "+hm(b.scanned_at):"";
+    $("rescan").disabled=b.scanning;
+    const devs=b.device_list;
+    if(!devs.length){$("devs").innerHTML=`<tr><td class="empty">${b.scanning?"Balayage du bus en cours (quelques secondes)…":b.error?esc(b.error):"Aucun appareil ne répond sur ce bus. Vérifie le câblage (SDA, SCL, masse) et les tirages."}</td></tr>`;return}
+    let h=`<tr><th>Adresse</th><th>Type</th><th>Description</th><th>État</th><th></th></tr>`,seg=null;
+    for(const d of devs){
+      if(d.where!==seg){seg=d.where;h+=`<tr class="seg"><td colspan="5">${seg==="direct"?"Directement sur le bus":esc(seg[0].toUpperCase()+seg.slice(1))}</td></tr>`}
+      const isPsu=d.kind==="psu";
+      h+=`<tr class="${isPsu?"click":""}" ${isPsu?`data-id="${esc(d.psu)}"`:""}><td><code>${d.addr}</code></td><td><span class="kind ${d.kind}">${KIND[d.kind]||d.kind}</span></td>
+        <td>${esc(d.label)}${d.detail?`<div class="loc">${esc(d.detail)}</div>`:""}</td>
+        <td>${isPsu?`<span class="pill ${d.summary}">${SEV[d.summary]}</span>`:""}</td><td>${isPsu?'<span class="btn sm">Ouvrir ›</span>':""}</td></tr>`;
+    }
+    $("devs").innerHTML=h;
+    document.querySelectorAll("#devs tr[data-id]").forEach(tr=>tr.onclick=()=>location.hash="#/psu/"+encodeURIComponent(tr.dataset.id));
+  },()=>2000);
+}
+
+/* ================= Page d'un PSU ================= */
+async function psuPage(id,tab){
+  if(!cur||cur.id!==id)cur={id,hist:{},histSince:0,events:[],evId:0,regRows:null,settings:null,chartKey:"",j:null};
+  cur.tab=tab;
+  if(!defs)defs=await api("api/defs").catch(()=>[]);
+  let j;
+  try{j=await api("api/psu?id="+encodeURIComponent(id))}catch(e){
+    crumbs([["Accueil","#/"],["PSU"]]);$("view").innerHTML=`<div class="bar"><a class="btn gray" href="#/">← Accueil</a></div><div class="empty">${esc(e.message)}</div>`;return}
+  cur.j=j;common(j);
+  const back="#/bus/"+j.bus;
+  crumbs([["Accueil","#/"],["Bus "+j.bus,back],[j.name]]);
+  $("view").innerHTML=`<div class="bar"><a class="btn gray" href="${back}">← Bus ${j.bus}</a>
+     <div><h1 id="ptitle">${esc(j.name)}</h1><div class="loc" id="psub">${esc(j.loc)}</div></div><span class="grow"></span><span id="pstate"></span></div>
+    <nav class="tabs">${TABS.map(([k,t])=>`<a href="#/psu/${encodeURIComponent(id)}/${k}" class="${k===tab?"on":""}">${t}</a>`).join("")}</nav>
+    <div id="tabc"></div>`;
+  const once={reglages:showSettings,registres:showRegisters}[tab];
+  if(once)once();
+  if(tab==="graphiques")initCharts();
+  loop(async()=>{
+    const j=await api("api/psu?id="+encodeURIComponent(id));cur.j=j;common(j);
+    const d=j.data,info=(d&&d.info)||{};
+    $("ptitle").textContent=info["Modèle (MFR_MODEL)"]?(info["Fabricant (MFR_ID)"]?info["Fabricant (MFR_ID)"]+" ":"")+info["Modèle (MFR_MODEL)"]:j.name;
+    $("psub").textContent=j.loc+(info["N° de série"]?" · SN "+info["N° de série"]:"");
+    $("pstate").innerHTML=d?`<span class="pill ${d.summary}">${SEV[d.summary]}</span>`:'<span class="pill pending">lecture…</span>';
+    const ev=await api(`api/events?id=${encodeURIComponent(id)}&since=${cur.evId}`);
+    for(const e of ev){cur.events.push(e);cur.evId=Math.max(cur.evId,e.id)}
+    if(tab==="mesures")showMeasures(j);
+    if(tab==="erreurs")showErrors(j);
+    if(tab==="graphiques")await updateCharts();
+  },()=>Math.max(1000,lastCommon.interval*1000));
+}
+function offlineMsg(d){return d?`<div class="note err">Hors ligne : ${esc(d.error||"")}</div>`:'<div class="empty">Première lecture en cours…</div>'}
+
+/* ---- Onglet Mesures ---- */
+function showMeasures(j){
+  const d=j.data;if(!d||!d.online){$("tabc").innerHTML=offlineMsg(d);return}
+  const M=j.metrics,v=d.values;
+  const tile=(l,val,u)=>`<div class="tile"><div class="l">${l}</div><div class="v">${val}<span class="u">${u}</span></div></div>`;
+  let t="";
+  for(const k of Object.keys(M))if(k in v)t+=tile(M[k].label,fmt(v[k],M[k].dec),M[k].unit);
+  if(v.pin>5&&v.pout!=null)t+=tile("Rendement (POUT / PIN)",(v.pout/v.pin*100).toFixed(1),"%");
+  if(d.operation!=null)t+=tile("OPERATION",d.operation&0x80?"ON":"OFF",hex(d.operation,2));
+  let h=`<div class="tiles">${t}</div>`;
+  const inf=Object.entries(d.info||{});
+  if(inf.length)h+=`<div class="panel"><h3 style="margin-top:0">Identité</h3><table>`+inf.map(([k,x])=>`<tr><td>${esc(k)}</td><td>${esc(x)}</td></tr>`).join("")+`</table></div>`;
+  if(d.limits&&d.limits.length){
+    const g={};d.limits.forEach(l=>(g[l.group]=g[l.group]||[]).push(l));
+    h+=`<div class="panel"><h3 style="margin-top:0">Limites et valeurs nominales (lecture)</h3>`+Object.entries(g).map(([n,ls])=>`<h3>${esc(n)}</h3><table>`+
+      ls.map(l=>`<tr><td>${l.label}</td><td><code>${hex(l.code,2)}</code></td><td class="n">${l.value.toFixed(3)} ${l.unit}</td></tr>`).join("")+`</table>`).join("")+`</div>`;
+  }
+  $("tabc").innerHTML=h;
+}
+
+/* ---- Onglet Erreurs ---- */
+function bitsHtml(reg,val){
+  const d=(defs||[]).find(x=>x.reg===reg);if(!d)return "";
+  return d.bits.map(([b,n,s,desc])=>`<span class="bit ${val&(1<<b)?"set "+s:""}" title="${esc(desc)}">${b} · ${esc(n)}</span>`).join("");
+}
+function showErrors(j){
+  const d=j.data;let h="";
+  if(j.control)h+=`<div class="bar"><button class="btn gray" onclick="act('clear_faults')">Effacer les défauts (CLEAR_FAULTS)</button></div>`;
+  if(!d||!d.online)h+=offlineMsg(d);
+  else{
+    h+=`<div class="panel"><h3 style="margin-top:0">Alarmes actives</h3>`;
+    const flags=d.word_flags.filter(f=>f.name!=="OFF");
+    if(!d.alarms.length&&!flags.length)h+=`<div class="ok-line">Aucune alarme</div>`;
+    else if(!d.alarms.length)h+=`<div>Pas de détail dans les registres STATUS_* ; résumé STATUS_WORD : ${flags.map(f=>`<span class="chip ${f.sev}" title="${esc(f.desc)}">${esc(f.name)}</span>`).join(" ")}</div>`;
+    else h+=`<table><tr><th>Gravité</th><th>Code</th><th>Registre / bit</th><th>Description</th></tr>`+
+      d.alarms.map(a=>`<tr><td><span class="chip ${a.sev}">${SEV[a.sev]}</span></td><td><b>${esc(a.name)}</b></td><td>${a.reg} bit ${a.bit}</td><td>${esc(a.desc)}</td></tr>`).join("")+`</table>`;
+    h+=`</div><div class="panel"><h3 style="margin-top:0">Registres de statut (survole un bit pour sa signification)</h3>`;
+    h+=`<div class="reg"><b>STATUS_WORD</b><code>${hex(d.status_word,4)}</code><div class="bits">${bitsHtml("STATUS_WORD",d.status_word)}</div></div>`;
+    for(const [r,v] of Object.entries(d.regs))h+=`<div class="reg"><b>${r}</b><code>${hex(v,2)}</code><div class="bits">${bitsHtml(r,v)}</div></div>`;
+    h+=`</div>`;
+  }
+  h+=`<div class="panel"><h3 style="margin-top:0">Journal de ce PSU</h3><table><tr><th>Heure</th><th>Gravité</th><th>Événement</th></tr>`+
+    (cur.events.length?cur.events.slice().reverse().map(e=>`<tr><td>${new Date(e.t*1000).toLocaleString()}</td><td><span class="chip ${e.sev}">${SEV[e.sev]}</span></td><td>${esc(e.msg)}</td></tr>`).join(""):
+    `<tr><td colspan="3" class="empty">Aucun événement depuis le démarrage</td></tr>`)+`</table></div>`;
+  $("tabc").innerHTML=h;
+}
+async function act(action,label){
+  const txt={clear_faults:"Effacer les défauts mémorisés",on:"Mettre en MARCHE (OPERATION = 0x80)",off:"COUPER la sortie immédiatement (OPERATION = 0x00)",
+    soft_off:"Arrêt progressif (OPERATION = 0x40)",margin_low:"Marge basse (OPERATION = 0x94)",margin_high:"Marge haute (OPERATION = 0x98)"}[action];
+  if(!confirm(txt+" ?"))return;
+  try{await post("api/action",{id:cur.id,action});if(cur.tab==="reglages")showSettings()}catch(e){alert("Échec : "+e.message)}
+}
+
+/* ---- Onglet Graphiques ---- */
+function initCharts(){
+  $("tabc").innerHTML=`<div class="bar"><label>Période : <select id="range"><option value="300">5 min</option><option value="900">15 min</option>
+    <option value="1800">30 min</option><option value="3600" selected>1 h</option></select></label><span class="grow"></span>
+    <a class="btn gray" href="api/export.csv?id=${encodeURIComponent(cur.id)}">⬇ Exporter CSV</a></div><div id="charts"><div class="empty">Chargement…</div></div>`;
+  $("range").onchange=paintAll;cur.chartKey="";
+}
+async function updateCharts(){
+  const h=await api(`api/history?id=${encodeURIComponent(cur.id)}&since=${cur.histSince}`);
+  for(const [k,pts] of Object.entries(h)){const a=cur.hist[k]=cur.hist[k]||[];
+    for(const p of pts){a.push(p);if(p[0]>cur.histSince)cur.histSince=p[0]}if(a.length>4000)a.splice(0,a.length-4000)}
+  const M=cur.j.metrics,keys=Object.keys(M).filter(k=>cur.hist[k]&&cur.hist[k].length);
+  if(keys.includes("pin")&&keys.includes("pout"))keys.push("eff");
+  if(keys.join()!==cur.chartKey){
+    cur.chartKey=keys.join();
+    $("charts").innerHTML=keys.length?keys.map(k=>{const m=k==="eff"?{label:"Rendement (POUT / PIN)",unit:"%"}:M[k];
+      return `<div class="ch"><h3>${m.label} <span style="text-transform:none">(${m.unit})</span></h3><canvas data-k="${k}"></canvas></div>`}).join(""):'<div class="empty">Pas encore de mesures…</div>';
+    document.querySelectorAll("#charts canvas").forEach(cv=>{cv.onmousemove=e=>{cv._hx=e.offsetX;paint(cv)};cv.onmouseleave=()=>{cv._hx=null;paint(cv)}});
+  }
+  paintAll();
+}
+function paintAll(){document.querySelectorAll("#charts canvas").forEach(paint)}
+function series(k){
+  if(k!=="eff")return cur.hist[k]||[];
+  const m=new Map(cur.hist.pout||[]);return (cur.hist.pin||[]).filter(p=>p[1]>5&&m.has(p[0])).map(p=>[p[0],m.get(p[0])/p[1]*100]);
+}
+function paint(cv){
+  const k=cv.dataset.k,M=cur.j.metrics,dec=k==="eff"?1:M[k].dec,unit=k==="eff"?"%":M[k].unit,pts=series(k);
+  const t1=cur.j.time;let t0=t1-parseInt($("range").value);
+  if(pts.length&&pts[0][0]>t0)t0=Math.min(pts[0][0],t1-30);
+  const col=getComputedStyle(document.documentElement).getPropertyValue("--acc");
+  drawChart(cv,[{name:k==="eff"?"Rendement":M[k].label,color:col,pts}],unit,Math.min(dec+1,3),t0,t1,lastCommon.interval*3);
+}
+function drawChart(cv,series,unit,dec,t0,t1,gap){
+  const dpr=window.devicePixelRatio||1,w=cv.clientWidth,h=cv.clientHeight;
+  if(cv.width!==Math.round(w*dpr)){cv.width=Math.round(w*dpr);cv.height=Math.round(h*dpr)}
+  const c=cv.getContext("2d");c.setTransform(dpr,0,0,dpr,0,0);c.clearRect(0,0,w,h);
+  const cs=getComputedStyle(document.documentElement),mut=cs.getPropertyValue("--mut"),bd=cs.getPropertyValue("--bd"),fg=cs.getPropertyValue("--fg"),card=cs.getPropertyValue("--card");
+  let lo=Infinity,hi=-Infinity;
+  for(const s of series)for(const p of s.pts){if(p[0]<t0)continue;if(p[1]<lo)lo=p[1];if(p[1]>hi)hi=p[1]}
+  c.font="11px system-ui";c.fillStyle=mut;
+  if(lo===Infinity){c.textAlign="center";c.fillText("pas de données sur cette période",w/2,h/2);return}
+  if(hi-lo<1e-9){lo-=1;hi+=1}else{const pad=(hi-lo)*.1;lo-=pad;hi+=pad}
+  const L=50,R=8,T=8,B=20,pw=w-L-R,ph=h-T-B,X=t=>L+(t-t0)/(t1-t0)*pw,Y=v=>T+(1-(v-lo)/(hi-lo))*ph;
+  c.strokeStyle=bd;c.lineWidth=1;
+  for(let i=0;i<=4;i++){const v=lo+(hi-lo)*i/4,y=Y(v);c.beginPath();c.moveTo(L,y);c.lineTo(w-R,y);c.stroke();c.textAlign="right";c.fillStyle=mut;c.fillText(v.toFixed(dec),L-5,y+4)}
+  for(let i=0;i<=4;i++){const t=t0+(t1-t0)*i/4;c.textAlign=i===0?"left":i===4?"right":"center";c.fillStyle=mut;
+    c.fillText(new Date(t*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit"}),X(t),h-5)}
+  c.lineWidth=1.8;c.lineJoin="round";
+  for(const s of series){c.strokeStyle=s.color;c.beginPath();let prev=null;
+    for(const p of s.pts){if(p[0]<t0)continue;const x=X(p[0]),y=Y(p[1]);
+      if(prev===null||p[0]-prev>gap)c.moveTo(x,y);else c.lineTo(x,y);prev=p[0]}c.stroke()}
+  if(cv._hx!=null&&cv._hx>=L&&cv._hx<=w-R){
+    const t=t0+(cv._hx-L)/pw*(t1-t0);c.strokeStyle=mut;c.beginPath();c.moveTo(cv._hx,T);c.lineTo(cv._hx,T+ph);c.stroke();
+    const lines=[];let tt=t;
+    for(const s of series){let best=null;for(const p of s.pts)if(best===null||Math.abs(p[0]-t)<Math.abs(best[0]-t))best=p;
+      if(best&&Math.abs(best[0]-t)<gap*2){lines.push([s.color,best[1].toFixed(dec)+" "+unit]);tt=best[0]}}
+    if(lines.length){
+      const head=new Date(tt*1000).toLocaleTimeString(),bw=Math.max(c.measureText(head).width,...lines.map(l=>c.measureText(l[1]).width))+26,bh=16*(lines.length+1)+6;
+      let bx=cv._hx+10;if(bx+bw>w-R)bx=cv._hx-bw-10;
+      c.fillStyle=card;c.strokeStyle=bd;c.fillRect(bx,T+4,bw,bh);c.strokeRect(bx,T+4,bw,bh);
+      c.textAlign="left";c.fillStyle=mut;c.fillText(head,bx+8,T+18);
+      lines.forEach((l,i)=>{c.fillStyle=l[0];c.fillRect(bx+8,T+25+i*16,8,8);c.fillStyle=fg;c.fillText(l[1],bx+22,T+33+i*16)});
+    }
+  }
+}
+
+/* ---- Onglet Réglages ---- */
+async function showSettings(){
+  const ctl=lastCommon.control||(cur.j&&cur.j.control);
+  $("tabc").innerHTML='<div class="empty">Lecture des valeurs modifiables…</div>';
+  let s;
+  try{s=await api("api/settings?id="+encodeURIComponent(cur.id))}catch(e){$("tabc").innerHTML=`<div class="note err">${esc(e.message)}</div>`;return}
+  if(cur.tab!=="reglages")return;
+  let h=ctl?"":`<div class="note">Lecture seule. Pour modifier les valeurs, relance le script avec <code>--auth utilisateur:motdepasse --control</code>.</div>`;
+  if(s.write_protect)h+=`<div class="note err">WRITE_PROTECT = ${hex(s.write_protect,2)} : le PSU risque de refuser les écritures.</div>`;
+  h+=`<div class="panel"><h3 style="margin-top:0">Commandes</h3><div class="bar" style="margin:0">
+    <span>OPERATION : <b>${s.operation==null?"n/a":hex(s.operation,2)+(s.operation&0x80?" (ON)":" (OFF)")}</b></span>
+    <button class="btn green" ${ctl?"":"disabled"} onclick="act('on')">ON</button>
+    <button class="btn red" ${ctl?"":"disabled"} onclick="act('off')">OFF</button>
+    <button class="btn gray" ${ctl?"":"disabled"} onclick="act('soft_off')">Arrêt progressif</button>
+    <button class="btn amber" ${ctl?"":"disabled"} onclick="act('margin_low')">Marge basse</button>
+    <button class="btn amber" ${ctl?"":"disabled"} onclick="act('margin_high')">Marge haute</button>
+    <button class="btn gray" ${ctl?"":"disabled"} onclick="act('clear_faults')">Effacer les défauts</button>
+    <span class="grow"></span><button class="btn gray" onclick="showSettings()">↻ Relire</button></div></div>`;
+  const g={};s.settings.forEach(x=>(g[x.group]=g[x.group]||[]).push(x));
+  for(const [name,rows] of Object.entries(g)){
+    h+=`<div class="panel"><h3 style="margin-top:0">${esc(name)}</h3><table><tr><th>Registre</th><th>Code</th><th class="n">Valeur actuelle</th><th>Nouvelle valeur</th><th></th><th></th></tr>`;
+    for(const x of rows){
+      const sup=x.value!=null,dis=!ctl||!sup?"disabled":"";
+      h+=`<tr><td><b>${x.name}</b></td><td><code>${x.code}</code></td><td class="n" id="v${x.code}">${sup?x.value.toFixed(3)+" "+x.unit:'<span class="mut">non supporté</span>'}</td>
+        <td><input type="number" step="any" id="i${x.code}" ${dis} placeholder="${esc(x.unit)}"></td>
+        <td><button class="btn sm" ${dis} onclick="writeReg('${x.code}','${x.name}','${esc(x.unit)}')">Appliquer</button></td><td class="res" id="r${x.code}"></td></tr>`;
+    }
+    h+=`</table></div>`;
+  }
+  $("tabc").innerHTML=h;
+}
+async function writeReg(code,name,unit){
+  const v=parseFloat($("i"+code).value);
+  if(isNaN(v)){$("r"+code).textContent="valeur invalide";$("r"+code).className="res bad";return}
+  if(!confirm(`Écrire ${v} ${unit} dans ${name} (${code}) ?\nUne mauvaise valeur peut couper ou endommager l'alimentation.`))return;
+  $("r"+code).textContent="écriture…";$("r"+code).className="res";
+  try{const r=await post("api/write",{id:cur.id,code,value:v});
+    $("v"+code).textContent=r.value==null?"?":r.value.toFixed(3)+" "+unit;$("r"+code).textContent="✓ écrit";$("r"+code).className="res ok";$("i"+code).value=""}
+  catch(e){$("r"+code).textContent="✗ "+e.message;$("r"+code).className="res bad"}
+}
+
+/* ---- Onglet Registres ---- */
+function showRegisters(){
+  $("tabc").innerHTML=`<div class="bar"><button class="btn" id="rread">Lire tous les registres</button>
+    <input type="search" id="rfilter" placeholder="filtrer (nom, code, catégorie)…"><span id="rstat" class="mut"></span></div>
+    <div id="regs" class="panel"><div class="empty">« Lire tous les registres » interroge ~105 registres PMBus (quelques secondes).</div></div>`;
+  $("rfilter").oninput=renderRegs;
+  $("rread").onclick=async()=>{
+    $("rread").disabled=true;$("rstat").textContent="lecture en cours…";
+    try{const j=await api("api/registers?id="+encodeURIComponent(cur.id));cur.regRows=j.registers;renderRegs();
+      $("rstat").textContent=cur.regRows.filter(x=>x.val!=="n/a").length+" / "+cur.regRows.length+" registres supportés — "+new Date().toLocaleTimeString()}
+    catch(e){$("rstat").textContent="erreur : "+e.message}
+    $("rread").disabled=false;
+  };
+  if(cur.regRows)renderRegs();
+}
+function renderRegs(){
+  if(!cur.regRows)return;
+  const f=$("rfilter").value.toLowerCase(),rows=cur.regRows.filter(r=>!f||(r.name+r.code+r.cat+r.desc).toLowerCase().includes(f));
+  const g={};rows.forEach(r=>(g[r.cat]=g[r.cat]||[]).push(r));
+  $("regs").innerHTML=Object.entries(g).map(([c,rs])=>`<h3>${esc(c)}</h3><table><tr><th>Code</th><th>Registre</th><th>Valeur</th><th>Description</th></tr>`+
+    rs.map(r=>`<tr><td><code>${r.code}</code></td><td><b>${esc(r.name)}</b></td><td>${esc(r.val)}</td><td class="mut">${esc(r.desc)}</td></tr>`).join("")+`</table>`).join("")||'<div class="empty">Aucun résultat</div>';
+}
+route();
+</script></body></html>
+"""
 
 
 class Server(ThreadingHTTPServer):
@@ -1751,15 +2097,6 @@ def ensure_cert(certdir, regen=False):
     return crt, key
 
 
-def wait_first_poll(state, psus, timeout=20):
-    end = time.time() + timeout
-    while time.time() < end:
-        with state.lock:
-            if all(p.name in state.latest for p in psus):
-                return
-        time.sleep(0.2)
-
-
 def print_short_banner(scheme, port, args):
     ips = [args.host] if args.host != "0.0.0.0" else (local_ips() or ["<ip-de-la-BBB>"])
     print("PMBus monitor - interface web :")
@@ -1767,54 +2104,20 @@ def print_short_banner(scheme, port, args):
         print("  %s://%s:%d" % (scheme, ip, port), flush=True)
 
 
-def print_banner(state, psus, workers, scheme, port, args, backend=""):
-    ips = [args.host] if args.host != "0.0.0.0" else local_ips()
-    host = socket.gethostname()
-    line = "=" * 64
-    print("\n" + line)
-    print(" PMBus Monitor - interface web disponible")
-    print(line)
-    print(" Ouvre l'une de ces adresses dans ton navigateur :")
-    for ip in ips:
-        print("   %s://%s:%d" % (scheme, ip, port))
-    if args.host == "0.0.0.0":
-        print("   %s://%s.local:%d   (si ton réseau gère le mDNS)" % (scheme, host, port))
-    if not ips:
-        print("   %s://<ip-de-la-BBB>:%d   (aucune IP détectée)" % (scheme, port))
-    if scheme == "https":
-        print(" Certificat auto-signé : accepte l'avertissement du navigateur")
-        print("   (Avancé > Continuer). Certificat : %s" % args.certdir)
-    if args.auth:
-        print(" Connexion : utilisateur '%s' (mot de passe défini avec --auth)" % args.auth.split(":")[0])
-    else:
-        print(" Accès sans mot de passe (ajoute --auth utilisateur:motdepasse)")
-    print(" Intervalle de lecture : %g s - historique : %d min" % (args.interval, args.history // 60))
-    print(" Pilote I2C : %s%s" % (backend, "" if backend != "ioctl" else "  (conseil : pip install smbus2)"))
-    if args.control:
-        print(" ACTIONS D'ÉCRITURE ACTIVÉES (effacer défauts, ON/OFF) - protégées par le mot de passe")
-    print("-" * 64)
-    print(" %d PSU, %d bus I2C :" % (len(psus), len(workers)))
-    with state.lock:
-        for p in psus:
-            r = state.latest.get(p.name, {})
-            if r.get("online"):
-                info = r.get("info", {})
-                what = " ".join(x for x in (info.get("Fabricant (MFR_ID)"), info.get("Modèle (MFR_MODEL)")) if x)
-                st = {"ok": "OK", "warn": "AVERTISSEMENT", "fault": "DÉFAUT", "off": "ÉTEINT"}.get(r["summary"], r["summary"])
-                print("   [%-13s] %-12s %s  %s" % (st, p.name, p.loc, what))
-            else:
-                print("   [HORS LIGNE   ] %-12s %s  %s" % (p.name, p.loc, r.get("error", "")))
-    if not any(state.latest.get(p.name, {}).get("online") for p in psus):
-        print("\n Aucun PSU ne répond : vérifie le câblage et l'alimentation du PSU, lance --scan")
-        print(" pour voir les adresses, puis relance avec -b <bus> --addr 0x5X (et --mux 0x7X avec un PDB).")
-    print(line)
-    print(" Ctrl+C pour arrêter\n", flush=True)
+def run_web(args):
+    mon = Monitor(args)
+    manual = bool(args.config or args.pages) or (args.addr is not None and not args.autodetect)
+    if manual:   # PSU décrits par --config / --addr : pas de balayage automatique
+        psus = psus_from_config(args.config, args.bus)[0] if args.config else psus_from_args(args)
+        unique_names(psus)
+        for b in sorted({p.bus for p in psus}):
+            mon.bus(b).add_psus([p for p in psus if p.bus == b])
+        auto = []
+    else:        # balayage en tâche de fond des bus (tous sauf 0, ou celui de -b)
+        auto = [args.bus] if args.bus_explicit else [n for n in mon.available() if n > 0]
+        for n in auto:
+            mon.bus(n).scan_async()
 
-
-def run_web(psus, args, build):
-    mon = Monitor(args, build)
-    mon.backend = "simulation" if args.mock else ("smbus2" if _SMBus else "ioctl")
-    mon.start(psus)
     port = args.port or (8443 if args.https else 8080)
     server = Server((args.host, port), make_handler(mon, args.auth, args.control))
     scheme = "http"
@@ -1829,21 +2132,17 @@ def run_web(psus, args, build):
         server.ctx = ctx
         scheme = "https"
 
-    def auto_rescan():   # tant qu'aucun PSU n'est trouvé, on retente toutes les 30 s (branchement à chaud)
-        while True:
-            time.sleep(30)
-            if not mon.state.seen:
-                try:
-                    mon.rescan()
-                except Exception as e:
-                    print("rescan : %s" % e, file=sys.stderr)
+    def auto_rescan():   # tant qu'aucun PSU n'est vu, on rebalaye toutes les 30 s (branchement à chaud)
+        while not mon.stop.wait(30):
+            if auto and not mon.state.seen:
+                for n in auto:
+                    mon.bus(n).scan_async()
 
     threading.Thread(target=auto_rescan, daemon=True).start()
+    print_short_banner(scheme, port, args)
     if args.verbose:
-        wait_first_poll(mon.state, psus)
-        print_banner(mon.state, psus, mon.workers, scheme, port, args, mon.backend)
-    else:
-        print_short_banner(scheme, port, args)
+        print("Pilote I2C : %s ; bus balayés : %s" % (mon.backend, ", ".join(map(str, auto)) or "aucun (config)"),
+              flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1981,6 +2280,16 @@ def main():
         sys.exit("--control modifie le matériel : il exige --auth utilisateur:motdepasse (et l'interface web).")
 
     cfg_interval = None
+    if args.config:
+        try:
+            cfg_interval = psus_from_config(args.config, args.bus)[1]
+        except (OSError, ValueError, KeyError) as e:
+            sys.exit("Configuration impossible : %s" % e)
+    args.interval = args.interval or cfg_interval or 2.0
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    if args.web:
+        run_web(args)
+        return
 
     def build(report=True):
         if args.config:
@@ -1990,19 +2299,11 @@ def main():
         return psus_from_args(args)
 
     try:
-        if args.config:
-            cfg_interval = psus_from_config(args.config, args.bus)[1]
         psus = build()
     except (OSError, ValueError, KeyError) as e:
         sys.exit("Configuration impossible : %s" % e)
-    args.interval = args.interval or cfg_interval or 2.0
-    if not psus and not args.web:
+    if not psus:
         sys.exit("Aucun PSU trouvé. Lance --scan pour voir ce qui répond sur les bus.")
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-
-    if args.web:
-        run_web(psus, args, build)
-        return
 
     unique_names(psus)
     if args.verbose:

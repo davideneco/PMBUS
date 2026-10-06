@@ -19,25 +19,31 @@ PMBUS/
 `pmbus_monitor.py` : un seul fichier. Recommandé : `pip install smbus2` (sinon accès direct à `/dev/i2c-N`).
 
 ```
-python3 pmbus_monitor.py                        # détecte tout (bus, mux, PSU) et ouvre la page web
-python3 pmbus_monitor.py --scan                 # rapport de détection seulement
-python3 pmbus_monitor.py -b 2 --addr 0x58 0x59  # forcer bus / adresses
-python3 pmbus_monitor.py --mux 0x70 --channels 0-3 --addr 0x58   # via un PDB
-python3 pmbus_monitor.py --config psus.example.json              # multi-bus / multi-mux
-python3 pmbus_monitor.py --auth admin:secret --control           # + actions d'écriture
+python3 pmbus_monitor.py                        # page web http://<ip>:8080
+python3 pmbus_monitor.py --auth admin:secret --control   # + modification des valeurs
 python3 pmbus_monitor.py --mock                 # simulation, sans matériel
+python3 pmbus_monitor.py --scan                 # rapport de détection dans le terminal
 ```
 
-Le terminal n'affiche que le titre et l'adresse de la page (`http://<ip>:8080`). `--verbose` ajoute le détail
-(détection, pilote I2C, état des PSU) ; `--scan` donne le rapport de détection. `--https` active HTTPS (port 8443,
-certificat auto-signé). Attention : sans HTTPS, le mot de passe `--auth` circule en clair sur le réseau.
+Le terminal n'affiche que l'adresse de la page (`--verbose` pour plus de détail).
 
-Seuls les PSU qui ont répondu au moins une fois sont affichés. Deux emplacements qui renvoient le même numéro de série
-sont considérés comme un seul PSU (doublon ignoré). Si aucun PSU n'est trouvé, la page reste ouverte, le script
-retente toutes les 30 s et le bouton « Rescanner » force la détection.
+### Navigation
+1. **Accueil** : la liste des bus I2C (`/dev/i2c-*`) et des PSU déjà détectés.
+2. **Page d'un bus** : toutes les adresses qui répondent, regroupées par segment (direct, canaux des mux),
+   avec leur nature : alimentation PMBus (fabricant, modèle, série), mux, EEPROM, composants de la BBB,
+   ou type probable déduit de l'adresse. Bouton « Rescanner ».
+3. **Page d'un PSU** (clic sur une alimentation), en onglets :
+   - *Mesures* : tensions, courants, puissances, températures, ventilateurs, rendement, identité, limites ;
+   - *Graphiques* : historique d'1 h, export CSV ;
+   - *Erreurs* : alarmes actives, registres STATUS_* bit par bit, journal du PSU ;
+   - *Réglages* : ON / OFF / marges / effacer les défauts et limites modifiables (avec `--control`) ;
+   - *Registres* : ~105 registres PMBus décodés.
 
-Onglets : vue d'ensemble, détails et codes d'erreur (tous les registres STATUS_*), graphiques (+ export CSV),
-registres (≈105 registres PMBus décodés), journal des événements.
-`--control` (exige `--auth`) ajoute les boutons « Effacer les défauts », ON et OFF.
+Les boutons « ← Retour », le fil d'Ariane et le bouton « précédent » du navigateur fonctionnent partout.
+Les bus autres que 0 sont balayés au démarrage ; le bus 0 (interne à la BBB) seulement quand on l'ouvre.
+Deux emplacements renvoyant le même numéro de série sont signalés comme doublon.
+
+Les écritures (`--control`, qui exige `--auth`) sont vérifiées : si le PSU les refuse (STATUS_CML), l'erreur s'affiche.
+Sans `--https`, le mot de passe circule en clair : à réserver à un réseau local.
 
 Documentation PMBus : dossier `docs/`.
