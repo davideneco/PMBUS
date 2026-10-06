@@ -1,0 +1,10 @@
+{
+  "interval": 2,
+  "psus": [
+    {"name": "PDB-1", "bus": 2, "addr": "0x58", "mux": "0x70", "channel": 0},
+    {"name": "PDB-2", "bus": 2, "addr": "0x58", "mux": "0x70", "channel": 1},
+    {"name": "PDB-3", "bus": 2, "addr": "0x58", "mux": "0x70", "channel": 2},
+    {"name": "Direct", "bus": 1, "addr": "0x5A"},
+    {"name": "Multi-rail", "bus": 2, "addr": "0x40", "page": 1}
+  ]
+}
