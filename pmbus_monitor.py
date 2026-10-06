@@ -1454,6 +1454,8 @@ class Monitor:
         self.lock = threading.Lock()
         self.csv_lock = threading.Lock()
         self.backend = "simulation" if args.mock else ("smbus2" if _SMBus else "ioctl")
+        self.started = time.time()
+        self.urls = []
 
     def available(self):
         if self.args.mock:
@@ -1579,7 +1581,9 @@ def make_handler(mon, auth, control):
                 self._send(page, "text/html; charset=utf-8")
             elif u.path == "/api/buses":
                 d = self._common()
-                d.update(buses=[mon.bus(n).info() for n in mon.available()], psus=state.visible())
+                d.update(buses=[mon.bus(n).info() for n in mon.available()], psus=state.visible(),
+                         urls=mon.urls, started=mon.started, events=state.seq, auth=bool(auth),
+                         history=mon.args.history)
                 self._json(d)
             elif u.path == "/api/bus":
                 n = int(num("num", -1))
@@ -1629,6 +1633,10 @@ def make_handler(mon, auth, control):
             except (ValueError, TypeError):
                 return self._json({"error": "JSON invalide"}, 400)
             path = urllib.parse.urlparse(self.path).path
+            if path == "/api/scan" and body.get("bus") == "all":
+                for n in mon.available():
+                    mon.bus(n).scan_async()
+                return self._json({"scanning": True})
             if path == "/api/scan":
                 try:
                     bnum = int(body.get("bus"))
@@ -1725,6 +1733,11 @@ input[type=number]{width:120px}
 .ch{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:10px}
 .ch h3{margin:0 0 4px}.ch canvas{width:100%;height:190px;display:block}
 .empty{color:var(--mut);padding:24px;text-align:center}
+.menu{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
+.mtile{display:flex;align-items:center;gap:16px;background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:20px;color:var(--fg);text-decoration:none}
+.mtile:hover{border-color:var(--acc);background:var(--hov)}.mtile .ico{font-size:30px;width:52px;height:52px;border-radius:12px;background:var(--hov);display:flex;align-items:center;justify-content:center;flex:none}
+.mtile .name{font-size:17px;font-weight:600}.mtile .arrow{margin-left:auto;font-size:26px;color:var(--mut)}
+.addr{font-family:ui-monospace,monospace;font-size:22px;font-weight:700}
 .res{font-size:13px}.res.ok{color:var(--ok)}.res.bad{color:var(--fault)}
 </style></head><body>
 <header><a class="brand" href="#/">PMBus Monitor</a><nav id="crumbs"></nav><span class="grow"></span><span id="sim"></span><span id="meta"></span></header>
@@ -1756,63 +1769,150 @@ function loop(fn,ms){
 }
 window.onhashchange=route;
 function route(){
-  const r=location.hash.replace(/^#\/?/,"").split("/").filter(Boolean);
-  window.scrollTo(0,0);
-  if(r[0]==="bus")busPage(+r[1]);else if(r[0]==="psu")psuPage(decodeURIComponent(r[1]),r[2]||"mesures");else home();
+  const r=location.hash.replace(/^#\/?/,"").split("/").filter(Boolean).map(decodeURIComponent);
+  window.scrollTo(0,0);cur=r[0]==="pmbus"&&r[2]?cur:null;
+  if(r[0]==="pmbus"){
+    if(r[2])psuPage(r[2],r[3]||"mesures");else if(r[1]!==undefined)pmbusBus(+r[1]);else pmbusBuses();
+  }else if(r[0]==="i2c"){if(r[1]!==undefined)i2cBus(+r[1]);else i2cBuses()}
+  else if(r[0]==="journal")journal();
+  else if(r[0]==="systeme")systemPage();
+  else menu();
 }
+const C_HOME=["Accueil","#/"],C_PSU=["PSU / PMBus","#/pmbus"],C_I2C=["Scanner I2C","#/i2c"];
+function scanningAny(j){return j.buses.some(b=>b.scanning||!b.scanned_at)}
+async function rescanAll(btn){if(btn)btn.disabled=true;try{await post("api/scan",{bus:"all"})}catch(e){alert(e.message)}}
 
-/* ================= Accueil : choix du bus ================= */
-function psuCard(p){
-  return `<a class="card ${p.summary}" href="#/psu/${encodeURIComponent(p.id)}"><div class="top"><span class="name">${esc(p.model||p.name)}</span><span class="pill ${p.summary}">${SEV[p.summary]}</span></div>
-  <div class="loc">${esc(p.loc)}${p.serial?" · SN "+esc(p.serial):""}</div>
-  <div class="stats">${p.pout!=null?"POUT "+p.pout.toFixed(0)+" W":""}${p.alarms?` · <span class="err">${p.alarms} alarme(s)</span>`:""}</div><div class="go">Ouvrir ›</div></a>`;
-}
-function home(){
-  cur=null;crumbs([["Accueil"]]);
-  $("view").innerHTML=`<div class="bar"><h1>Choisis un bus I2C</h1></div><div id="buses" class="grid"></div>
-   <h2>PSU détectés</h2><div id="quick" class="grid"></div>`;
+/* ================= Menu principal ================= */
+function menu(){
+  crumbs([["Accueil"]]);
+  $("view").innerHTML=`<div class="bar"><h1>Menu principal</h1></div><div class="menu" id="menu"></div>`;
   loop(async()=>{
     const j=await api("api/buses");common(j);
-    $("buses").innerHTML=j.buses.map(b=>{
-      const st=b.scanning?'<span class="pill pending">balayage…</span>':b.error?'<span class="pill fault">erreur</span>':"";
-      const txt=b.scanning?"balayage en cours…":b.error?esc(b.error):b.scanned_at?`${b.devices} appareil(s) · ${b.psus} PSU`:"pas encore balayé — ouvre-le pour lancer la détection";
-      return `<a class="card" href="#/bus/${b.num}"><div class="top"><span class="name">Bus I2C ${b.num}</span>${st}</div>
-       <div class="loc">/dev/i2c-${b.num}${b.hint?" · "+esc(b.hint):""}</div><div class="stats">${txt}</div>
-       <div class="chips">${b.psu_list.map(p=>`<span class="pill ${p.summary}">${esc(p.model||p.name)}</span>`).join("")}</div><div class="go">Ouvrir ›</div></a>`;
-    }).join("")||'<div class="empty">Aucun bus I2C trouvé (/dev/i2c-*). Active le bus (config-pin / overlay).</div>';
-    $("quick").innerHTML=j.psus.length?j.psus.map(psuCard).join(""):'<div class="empty">Aucun PSU détecté pour l\'instant. Ouvre un bus pour voir ce qui y est branché.</div>';
+    const ps=j.psus,bad=ps.filter(p=>p.summary==="fault").length,warn=ps.filter(p=>p.summary==="warn").length;
+    const devs=j.buses.reduce((n,b)=>n+b.devices,0),busOk=j.buses.filter(b=>b.devices>0).length;
+    const st=scanningAny(j)?" · détection en cours…":"";
+    const tile=(href,icon,title,txt,extra)=>`<a class="mtile" href="${href}"><div class="ico">${icon}</div><div><div class="name">${title}</div><div class="mut">${txt}</div>${extra||""}</div><div class="arrow">›</div></a>`;
+    $("menu").innerHTML=
+      tile("#/pmbus","⚡","PSU / PMBus",`${ps.length} alimentation(s) détectée(s)${st}`,
+        (bad||warn)?`<div class="chips">${bad?`<span class="pill fault">${bad} en défaut</span>`:""}${warn?`<span class="pill warn">${warn} avertissement(s)</span>`:""}</div>`:(ps.length?'<div class="chips"><span class="pill ok">tout est OK</span></div>':""))+
+      tile("#/i2c","🔍","Scanner I2C",`${devs} appareil(s) sur ${busOk} bus actif(s)${st}`)+
+      tile("#/journal","📋","Journal",`${j.events} événement(s) depuis le démarrage`)+
+      tile("#/systeme","⚙️","Système",`pilote ${esc(j.backend)}${j.control?" · modifications autorisées":" · lecture seule"}`);
   },3000);
 }
 
-/* ================= Page d'un bus : liste des adresses ================= */
-function busPage(n){
-  cur=null;crumbs([["Accueil","#/"],["Bus "+n]]);
-  $("view").innerHTML=`<div class="bar"><a class="btn gray" href="#/">← Accueil</a><h1>Bus I2C ${n}</h1><span id="hint" class="mut"></span>
-    <span class="grow"></span><span id="scaninfo" class="mut"></span><button class="btn" id="rescan">↻ Rescanner</button></div>
-    <div class="panel"><table id="devs"><tr><td class="empty">Chargement…</td></tr></table></div>
-    <p class="mut">Seules les alimentations PMBus sont réellement interrogées ; les autres descriptions (« probable ») sont déduites de l'adresse.
-    Clique sur une alimentation pour ouvrir sa page.</p>`;
-  let asked=false;
-  $("rescan").onclick=async()=>{try{await post("api/scan",{bus:n});$("scaninfo").textContent="balayage en cours…";$("rescan").disabled=true}catch(e){alert(e.message)}};
+/* ================= PSU / PMBus : 1) choix du bus ================= */
+function pmbusBuses(){
+  crumbs([C_HOME,["PSU / PMBus"]]);
+  $("view").innerHTML=`<div class="bar"><a class="btn gray" href="#/">← Accueil</a><h1>PSU / PMBus — choisis un bus</h1><span class="grow"></span>
+    <button class="btn gray" id="rs">↻ Relancer la détection</button></div><div id="list" class="grid"></div>`;
+  $("rs").onclick=e=>rescanAll(e.target);
+  loop(async()=>{
+    const j=await api("api/buses");common(j);$("rs").disabled=scanningAny(j);
+    const buses=j.buses.filter(b=>b.psus>0);
+    $("list").innerHTML=buses.map(b=>{
+      const bad=b.psu_list.filter(p=>p.summary==="fault"||p.summary==="offline").length;
+      return `<a class="card ${bad?"fault":"ok"}" href="#/pmbus/${b.num}"><div class="top"><span class="name">Bus I2C ${b.num}</span><span class="pill ${bad?"fault":"ok"}">${b.psus} PSU</span></div>
+       <div class="loc">/dev/i2c-${b.num}${b.hint?" · "+esc(b.hint):""}</div>
+       <div class="chips">${b.psu_list.map(p=>`<span class="pill ${p.summary}">${esc(p.model||p.name)}</span>`).join("")}</div><div class="go">Choisir ›</div></a>`;
+    }).join("")||`<div class="empty">${scanningAny(j)?"Détection des bus en cours…":"Aucun bus avec une alimentation PMBus. Vérifie le câblage, puis « Relancer la détection »."}</div>`;
+  },3000);
+}
+
+/* ================= PSU / PMBus : 2) choix de l'adresse ================= */
+function pmbusBus(n){
+  crumbs([C_HOME,C_PSU,["Bus "+n]]);
+  $("view").innerHTML=`<div class="bar"><a class="btn gray" href="#/pmbus">← Bus I2C</a><h1>Bus I2C ${n} — choisis une adresse</h1><span class="grow"></span>
+    <span id="scaninfo" class="mut"></span><button class="btn gray" id="rs">↻ Rescanner</button></div><div id="list" class="grid"></div>`;
+  $("rs").onclick=async()=>{try{await post("api/scan",{bus:n})}catch(e){alert(e.message)}};
   loop(async()=>{
     const b=await api("api/bus?num="+n);common(b);
-    $("hint").textContent=b.hint?"/dev/i2c-"+n+" · "+b.hint:"/dev/i2c-"+n;
-    if(!b.scanned_at&&!b.scanning&&!asked){asked=true;await post("api/scan",{bus:n});b.scanning=true}
-    $("scaninfo").textContent=b.scanning?"balayage en cours…":b.error?b.error:b.scanned_at?"balayé à "+hm(b.scanned_at):"";
-    $("rescan").disabled=b.scanning;
+    $("rs").disabled=b.scanning;$("scaninfo").textContent=b.scanning?"balayage en cours…":b.scanned_at?"balayé à "+hm(b.scanned_at):"";
+    const ps=b.device_list.filter(d=>d.kind==="psu"&&d.summary!=="pending");
+    $("list").innerHTML=ps.map(d=>`<a class="card ${d.summary}" href="#/pmbus/${n}/${encodeURIComponent(d.psu)}">
+      <div class="top"><span class="addr">${d.addr}</span><span class="pill ${d.summary}">${SEV[d.summary]}</span></div>
+      <div class="name" style="margin-top:6px">${esc(d.model||"Alimentation PMBus")}</div>
+      <div class="loc">${d.where==="direct"?"directement sur le bus":esc(d.where)}${d.serial?" · SN "+esc(d.serial):""}</div>
+      <div class="stats">${d.pout!=null?"POUT "+d.pout.toFixed(0)+" W":""}${d.alarms?` · <span class="err">${d.alarms} alarme(s)</span>`:""}</div>
+      <div class="go">Voir les informations ›</div></a>`).join("")||`<div class="empty">${b.scanning?"Balayage en cours…":"Aucune alimentation PMBus sur ce bus."}</div>`;
+  },()=>Math.max(2000,lastCommon.interval*1000));
+}
+
+/* ================= Scanner I2C ================= */
+function i2cBuses(){
+  crumbs([C_HOME,["Scanner I2C"]]);
+  $("view").innerHTML=`<div class="bar"><a class="btn gray" href="#/">← Accueil</a><h1>Scanner I2C — choisis un bus</h1><span class="grow"></span>
+    <button class="btn gray" id="rs">↻ Relancer la détection</button></div><div id="list" class="grid"></div>`;
+  $("rs").onclick=e=>rescanAll(e.target);
+  loop(async()=>{
+    const j=await api("api/buses");common(j);$("rs").disabled=scanningAny(j);
+    $("list").innerHTML=j.buses.filter(b=>b.devices>0).map(b=>`<a class="card" href="#/i2c/${b.num}"><div class="top"><span class="name">Bus I2C ${b.num}</span>
+      <span class="pill pending">${b.devices} appareil(s)</span></div><div class="loc">/dev/i2c-${b.num}${b.hint?" · "+esc(b.hint):""}</div>
+      <div class="stats">${b.psus} alimentation(s) PMBus</div><div class="go">Choisir ›</div></a>`).join("")
+      ||`<div class="empty">${scanningAny(j)?"Détection des bus en cours…":"Aucun appareil ne répond sur les bus I2C."}</div>`;
+  },3000);
+}
+function i2cBus(n){
+  crumbs([C_HOME,C_I2C,["Bus "+n]]);
+  $("view").innerHTML=`<div class="bar"><a class="btn gray" href="#/i2c">← Bus I2C</a><h1>Bus I2C ${n} — appareils présents</h1><span class="grow"></span>
+    <span id="scaninfo" class="mut"></span><button class="btn gray" id="rs">↻ Rescanner</button></div>
+    <div class="panel"><table id="devs"><tr><td class="empty">Chargement…</td></tr></table></div>
+    <p class="mut">Seules les alimentations PMBus sont réellement interrogées ; les autres descriptions (« probable ») sont déduites de l'adresse.</p>`;
+  $("rs").onclick=async()=>{try{await post("api/scan",{bus:n})}catch(e){alert(e.message)}};
+  loop(async()=>{
+    const b=await api("api/bus?num="+n);common(b);
+    $("rs").disabled=b.scanning;$("scaninfo").textContent=b.scanning?"balayage en cours…":b.scanned_at?"balayé à "+hm(b.scanned_at):"";
     const devs=b.device_list;
-    if(!devs.length){$("devs").innerHTML=`<tr><td class="empty">${b.scanning?"Balayage du bus en cours (quelques secondes)…":b.error?esc(b.error):"Aucun appareil ne répond sur ce bus. Vérifie le câblage (SDA, SCL, masse) et les tirages."}</td></tr>`;return}
+    if(!devs.length){$("devs").innerHTML=`<tr><td class="empty">${b.scanning?"Balayage en cours…":"Aucun appareil ne répond sur ce bus."}</td></tr>`;return}
     let h=`<tr><th>Adresse</th><th>Type</th><th>Description</th><th>État</th><th></th></tr>`,seg=null;
     for(const d of devs){
       if(d.where!==seg){seg=d.where;h+=`<tr class="seg"><td colspan="5">${seg==="direct"?"Directement sur le bus":esc(seg[0].toUpperCase()+seg.slice(1))}</td></tr>`}
-      const isPsu=d.kind==="psu";
-      h+=`<tr class="${isPsu?"click":""}" ${isPsu?`data-id="${esc(d.psu)}"`:""}><td><code>${d.addr}</code></td><td><span class="kind ${d.kind}">${KIND[d.kind]||d.kind}</span></td>
+      const isPsu=d.kind==="psu"&&d.summary!=="pending";
+      h+=`<tr class="${isPsu?"click":""}" ${isPsu?`data-h="#/pmbus/${n}/${encodeURIComponent(d.psu)}"`:""}><td><code>${d.addr}</code></td><td><span class="kind ${d.kind}">${KIND[d.kind]||d.kind}</span></td>
         <td>${esc(d.label)}${d.detail?`<div class="loc">${esc(d.detail)}</div>`:""}</td>
         <td>${isPsu?`<span class="pill ${d.summary}">${SEV[d.summary]}</span>`:""}</td><td>${isPsu?'<span class="btn sm">Ouvrir ›</span>':""}</td></tr>`;
     }
     $("devs").innerHTML=h;
-    document.querySelectorAll("#devs tr[data-id]").forEach(tr=>tr.onclick=()=>location.hash="#/psu/"+encodeURIComponent(tr.dataset.id));
-  },()=>2000);
+    document.querySelectorAll("#devs tr[data-h]").forEach(tr=>tr.onclick=()=>location.hash=tr.dataset.h);
+  },2000);
+}
+
+/* ================= Journal ================= */
+function journal(){
+  crumbs([C_HOME,["Journal"]]);
+  $("view").innerHTML=`<div class="bar"><a class="btn gray" href="#/">← Accueil</a><h1>Journal des événements</h1></div><div class="panel"><table id="ev"></table></div>`;
+  let evs=[],last=0;
+  loop(async()=>{
+    const e=await api("api/events?since="+last);for(const x of e){evs.push(x);last=Math.max(last,x.id)}
+    const j=await api("api/buses");common(j);
+    const bus={};j.psus.forEach(p=>bus[p.id]=p.bus);
+    $("ev").innerHTML=`<tr><th>Heure</th><th>PSU</th><th>Gravité</th><th>Événement</th></tr>`+(evs.length?evs.slice().reverse().map(x=>
+      `<tr><td>${new Date(x.t*1000).toLocaleString()}</td><td>${bus[x.psu]!=null?`<a href="#/pmbus/${bus[x.psu]}/${encodeURIComponent(x.psu)}">${esc(x.name)}</a>`:esc(x.name)}</td>
+       <td><span class="chip ${x.sev}">${SEV[x.sev]}</span></td><td>${esc(x.msg)}</td></tr>`).join(""):`<tr><td colspan="4" class="empty">Aucun événement depuis le démarrage</td></tr>`);
+  },3000);
+}
+
+/* ================= Système ================= */
+function systemPage(){
+  crumbs([C_HOME,["Système"]]);
+  $("view").innerHTML=`<div class="bar"><a class="btn gray" href="#/">← Accueil</a><h1>Système</h1><span class="grow"></span>
+    <button class="btn gray" id="rs">↻ Relancer la détection de tous les bus</button></div><div id="sys"></div>`;
+  $("rs").onclick=e=>rescanAll(e.target);
+  loop(async()=>{
+    const j=await api("api/buses");common(j);$("rs").disabled=scanningAny(j);
+    const row=(k,v)=>`<tr><td>${k}</td><td>${v}</td></tr>`;
+    $("sys").innerHTML=`<div class="panel"><table>`+
+      row("Adresse(s) de cette page",j.urls.map(u=>`<code>${esc(u)}</code>`).join("<br>"))+
+      row("Pilote I2C",esc(j.backend)+(j.backend==="ioctl"?' <span class="mut">(conseil : pip install smbus2)</span>':""))+
+      row("Démarré le",new Date(j.started*1000).toLocaleString())+
+      row("Période de lecture",j.interval+" s")+row("Historique conservé",Math.round(j.history/60)+" min")+
+      row("Mot de passe",j.auth?"oui":"non (option --auth)")+
+      row("Modifications",j.control?"autorisées (--control)":"lecture seule (--auth … --control pour autoriser)")+
+      (j.mock?row("Mode","SIMULATION (--mock)"):"")+`</table></div>
+      <div class="panel"><h3 style="margin-top:0">Bus I2C</h3><table><tr><th>Bus</th><th>Broches</th><th>Appareils</th><th>PSU</th><th>Dernier balayage</th></tr>`+
+      j.buses.map(b=>`<tr><td>/dev/i2c-${b.num}</td><td>${esc(b.hint)}</td><td>${b.devices}</td><td>${b.psus}</td>
+        <td>${b.scanning?"en cours…":b.error?`<span class="err">${esc(b.error)}</span>`:b.scanned_at?hm(b.scanned_at):"—"}</td></tr>`).join("")+`</table></div>`;
+  },3000);
 }
 
 /* ================= Page d'un PSU ================= */
@@ -1822,13 +1922,13 @@ async function psuPage(id,tab){
   if(!defs)defs=await api("api/defs").catch(()=>[]);
   let j;
   try{j=await api("api/psu?id="+encodeURIComponent(id))}catch(e){
-    crumbs([["Accueil","#/"],["PSU"]]);$("view").innerHTML=`<div class="bar"><a class="btn gray" href="#/">← Accueil</a></div><div class="empty">${esc(e.message)}</div>`;return}
+    crumbs([C_HOME,C_PSU]);$("view").innerHTML=`<div class="bar"><a class="btn gray" href="#/pmbus">← Bus I2C</a></div><div class="empty">${esc(e.message)}</div>`;return}
   cur.j=j;common(j);
-  const back="#/bus/"+j.bus;
-  crumbs([["Accueil","#/"],["Bus "+j.bus,back],[j.name]]);
-  $("view").innerHTML=`<div class="bar"><a class="btn gray" href="${back}">← Bus ${j.bus}</a>
+  const back="#/pmbus/"+j.bus;
+  crumbs([C_HOME,C_PSU,["Bus "+j.bus,back],["0x"+id.split("-").pop().toUpperCase()]]);
+  $("view").innerHTML=`<div class="bar"><a class="btn gray" href="${back}">← Adresses du bus ${j.bus}</a>
      <div><h1 id="ptitle">${esc(j.name)}</h1><div class="loc" id="psub">${esc(j.loc)}</div></div><span class="grow"></span><span id="pstate"></span></div>
-    <nav class="tabs">${TABS.map(([k,t])=>`<a href="#/psu/${encodeURIComponent(id)}/${k}" class="${k===tab?"on":""}">${t}</a>`).join("")}</nav>
+    <nav class="tabs">${TABS.map(([k,t])=>`<a href="#/pmbus/${j.bus}/${encodeURIComponent(id)}/${k}" class="${k===tab?"on":""}">${t}</a>`).join("")}</nav>
     <div id="tabc"></div>`;
   const once={reglages:showSettings,registres:showRegisters}[tab];
   if(once)once();
@@ -2115,7 +2215,7 @@ def run_web(args):
         auto = []
     else:        # balayage en tâche de fond des bus (tous sauf 0, ou celui de -b)
         auto = [args.bus] if args.bus_explicit else [n for n in mon.available() if n > 0]
-        for n in auto:
+        for n in ([args.bus] if args.bus_explicit else mon.available()):   # bus 0 : lecture seule
             mon.bus(n).scan_async()
 
     port = args.port or (8443 if args.https else 8080)
@@ -2139,6 +2239,8 @@ def run_web(args):
                     mon.bus(n).scan_async()
 
     threading.Thread(target=auto_rescan, daemon=True).start()
+    ips = [args.host] if args.host != "0.0.0.0" else (local_ips() or ["<ip-de-la-BBB>"])
+    mon.urls = ["%s://%s:%d" % (scheme, ip, port) for ip in ips]
     print_short_banner(scheme, port, args)
     if args.verbose:
         print("Pilote I2C : %s ; bus balayés : %s" % (mon.backend, ", ".join(map(str, auto)) or "aucun (config)"),

@@ -28,17 +28,18 @@ python3 pmbus_monitor.py --scan                 # rapport de détection dans le 
 Le terminal n'affiche que l'adresse de la page (`--verbose` pour plus de détail).
 
 ### Navigation
-1. **Accueil** : la liste des bus I2C (`/dev/i2c-*`) et des PSU déjà détectés.
-2. **Page d'un bus** : toutes les adresses qui répondent, regroupées par segment (direct, canaux des mux),
-   avec leur nature : alimentation PMBus (fabricant, modèle, série), mux, EEPROM, composants de la BBB,
-   ou type probable déduit de l'adresse. Bouton « Rescanner ».
-3. **Page d'un PSU** (clic sur une alimentation), en onglets :
-   - *Mesures* : tensions, courants, puissances, températures, ventilateurs, rendement, identité, limites ;
-   - *Graphiques* : historique d'1 h, export CSV ;
-   - *Erreurs* : alarmes actives, registres STATUS_* bit par bit, journal du PSU ;
-   - *Réglages* : ON / OFF / marges / effacer les défauts et limites modifiables (avec `--control`) ;
-   - *Registres* : ~105 registres PMBus décodés.
+**Menu principal** : PSU / PMBus · Scanner I2C · Journal · Système.
 
+- **PSU / PMBus** → choix du bus (seuls les bus où une alimentation répond sont listés)
+  → choix de l'adresse (seules les adresses PSU qui existent) → fiche du PSU en onglets :
+  *Mesures*, *Graphiques* (+ export CSV), *Erreurs* (alarmes, STATUS_* bit par bit, journal),
+  *Réglages* (ON/OFF, marges, effacer les défauts, limites modifiables avec `--control`), *Registres* (~105 décodés).
+- **Scanner I2C** → bus ayant au moins un appareil → toutes les adresses présentes et leur nature
+  (alimentation, mux, EEPROM, composants de la BBB, type probable selon l'adresse).
+- **Journal** : tous les événements (alarmes, pertes de communication, actions).
+- **Système** : adresses de la page, pilote I2C, options, état de chaque bus, relance de la détection.
+
+Tous les bus sont balayés au démarrage (le bus 0 interne à la BBB en lecture seule).
 Les boutons « ← Retour », le fil d'Ariane et le bouton « précédent » du navigateur fonctionnent partout.
 Les bus autres que 0 sont balayés au démarrage ; le bus 0 (interne à la BBB) seulement quand on l'ouvre.
 Deux emplacements renvoyant le même numéro de série sont signalés comme doublon.
